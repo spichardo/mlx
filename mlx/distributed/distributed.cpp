@@ -60,6 +60,10 @@ class EmptyGroup : public GroupImpl {
     throw std::runtime_error(
         "Communication not implemented in an empty distributed group.");
   }
+  void barrier() override {
+    throw std::runtime_error(
+        "Barrier not implemented in an empty distributed group.");
+  }
 };
 
 } // namespace detail
@@ -78,6 +82,10 @@ int Group::size() const {
 
 Group Group::split(int color, int key /* = -1 */) const {
   return Group(group_->split(color, key));
+}
+
+void Group::barrier() {
+  return group_->barrier();
 }
 
 Group init(bool strict /* = false */) {
