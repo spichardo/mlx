@@ -4,6 +4,7 @@
 #include <memory>
 #include <stack>
 
+#include "mlx/fast.h"
 #include "mlx/io.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
@@ -25,6 +26,7 @@ using json = nlohmann::json;
 #define ST_U16 "U16"
 #define ST_U32 "U32"
 #define ST_U64 "U64"
+#define ST_F8_E4M3 "F8_E4M3"
 
 // Note: Complex numbers aren't in the spec yet so this could change -
 // https://github.com/huggingface/safetensors/issues/389
@@ -92,10 +94,52 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
     return bool_;
   } else if (str == ST_C64) {
     return complex64;
+  } else if (str == ST_F8_E4M3) {
+    // We convert this manually later
+    return uint8;
   } else {
     throw std::runtime_error(
         "[safetensor] unsupported dtype " + std::string(str));
   }
+}
+
+array f8_e4m3_to_float(array x, Dtype dtype, StreamOrDevice s) {
+  // From PyTorch:
+  // https://github.com/pytorch/pytorch/blob/e3643e1e0e923f0fc063dfab6f45c956d568919d/c10/util/Float8_e4m3fn.h#L46
+  std::string source = R"(
+    uint elem = thread_position_in_grid.x;
+    uint8_t val = x[elem];
+
+    const uint32_t w = (uint32_t)val << 24;
+    const uint32_t sign = w & 0x80000000;
+    const uint32_t nonsign = w & 0x7FFFFFFF;
+
+    uint32_t renorm_shift = metal::clz(nonsign);
+    renorm_shift = renorm_shift > 4 ? renorm_shift - 4 : 0;
+
+    const int32_t inf_nan_mask =
+        ((int32_t)(nonsign + 0x01000000) >> 8) & 0x7F800000;
+    const int32_t zero_mask = (int32_t)(nonsign - 1) >> 31;
+    uint32_t result = sign |
+        ((((nonsign << renorm_shift >> 4) + ((0x78 - renorm_shift) << 23)) |
+            inf_nan_mask) &
+            ~zero_mask);
+
+    float out = *(reinterpret_cast<thread float*>(&result));
+    y[elem] = static_cast<T>(out);
+  )";
+  auto kernel = fast::metal_kernel("f8_e4m3", {"x"}, {"y"}, source);
+  auto outputs = kernel(
+      {x},
+      {x.shape()},
+      {dtype},
+      {x.size(), 1, 1},
+      {256, 1, 1},
+      {{"T", dtype}},
+      std::nullopt,
+      false,
+      s);
+  return outputs[0];
 }
 
 /** Load array from reader in safetensor format */
@@ -147,6 +191,9 @@ SafetensorsLoad load_safetensors(
         std::make_shared<Load>(
             to_stream(s), in_stream, offset + data_offsets.at(0), false),
         std::vector<array>{});
+    if (dtype == ST_F8_E4M3) {
+      loaded_array = f8_e4m3_to_float(loaded_array, bfloat16, s);
+    }
     res.insert({item.key(), loaded_array});
   }
   return {res, metadata_map};
