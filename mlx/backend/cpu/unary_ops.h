@@ -34,6 +34,7 @@ DEFAULT_OP(ArcSin, asin)
 DEFAULT_OP(ArcSinh, asinh)
 DEFAULT_OP(ArcTan, atan)
 DEFAULT_OP(ArcTanh, atanh)
+DEFAULT_OP(BitwiseInvert, operator~)
 DEFAULT_OP(Ceil, ceil)
 DEFAULT_OP(Conjugate, conj)
 DEFAULT_OP(Cos, cos)
@@ -85,13 +86,14 @@ struct Sign {
   template <int N, typename T>
   Simd<T, N> operator()(Simd<T, N> x) {
     auto z = Simd<T, N>{0};
+    auto o = Simd<T, N>{1};
+    auto m = Simd<T, N>{-1};
     if constexpr (std::is_unsigned_v<T>) {
-      return x != z;
+      return simd::select(x == z, z, o);
     } else if constexpr (std::is_same_v<T, complex64_t>) {
       return simd::select(x == z, x, Simd<T, N>(x / simd::abs(x)));
     } else {
-      return simd::select(
-          x < z, Simd<T, N>{-1}, simd::select(x > z, Simd<T, N>{1}, z));
+      return simd::select(x < z, m, simd::select(x > z, o, z));
     }
   }
   SINGLE()

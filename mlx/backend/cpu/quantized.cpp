@@ -3,6 +3,7 @@
 #include <cassert>
 
 #include "mlx/backend/cpu/copy.h"
+#include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/simd/simd.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
@@ -164,8 +165,8 @@ simd::Simd<uint32_t, S> extract_bits_simd(const uint32_t* w) {
   } else if constexpr (bits == 8 && S == 8) {
     constexpr std::array<uint32_t, 8> shifts_ = {{0, 8, 16, 24, 0, 8, 16, 24}};
     auto shifts(*(simd::Simd<uint32_t, S>*)&shifts_);
-    auto l = simd::Simd<uint32_t, 4>(*w++);
-    auto r = simd::Simd<uint32_t, 4>(*w);
+    auto l = simd::Simd<uint32_t, S / 2>(*w++);
+    auto r = simd::Simd<uint32_t, S / 2>(*w);
     wi = simd::Simd<uint32_t, S>(l, r);
     wi = wi >> shifts;
     wi = wi & bitmask;
@@ -316,7 +317,8 @@ void _qmm_dispatch_typed(
   }
 }
 
-void _qmm_dispatch(
+template <typename T>
+void _qmm_dispatch_typed(
     array& out,
     const array& x,
     const array& w,
@@ -328,63 +330,61 @@ void _qmm_dispatch(
   int K = x.shape(-1);
   int M = x.ndim() > 1 ? x.shape(-2) : 1;
   int N = out.shape(-1);
-
   int w_els = w.ndim() > 2 ? w.shape(-1) * w.shape(-2) : 0;
   int g_els = w.ndim() > 2 ? scales.shape(-1) * scales.shape(-2) : 0;
-
   int batch_size = x.size() / (K * M);
+
+  auto out_ptr = out.data<T>();
+  auto x_ptr = x.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  auto scales_ptr = scales.data<T>();
+  auto biases_ptr = biases.data<T>();
   for (int i = 0; i < batch_size; i++) {
-    switch (x.dtype()) {
-      case float32:
-        _qmm_dispatch_typed<float>(
-            out.data<float>() + i * M * N,
-            x.data<float>() + elem_to_loc(i * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(i * w_els, w),
-            scales.data<float>() + elem_to_loc(i * g_els, scales),
-            biases.data<float>() + elem_to_loc(i * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      case float16:
-        _qmm_dispatch_typed<float16_t>(
-            out.data<float16_t>() + i * M * N,
-            x.data<float16_t>() + elem_to_loc(i * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(i * w_els, w),
-            scales.data<float16_t>() + elem_to_loc(i * g_els, scales),
-            biases.data<float16_t>() + elem_to_loc(i * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      case bfloat16:
-        _qmm_dispatch_typed<bfloat16_t>(
-            out.data<bfloat16_t>() + i * M * N,
-            x.data<bfloat16_t>() + elem_to_loc(i * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(i * w_els, w),
-            scales.data<bfloat16_t>() + elem_to_loc(i * g_els, scales),
-            biases.data<bfloat16_t>() + elem_to_loc(i * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      default:
-        throw std::invalid_argument(
-            "[quantized_matmul] only floating types are supported");
-    }
+    _qmm_dispatch_typed<T>(
+        out_ptr + i * M * N,
+        x_ptr + elem_to_loc(i * M * K, x.shape(), x.strides()),
+        w_ptr + elem_to_loc(i * w_els, w.shape(), w.strides()),
+        scales_ptr + elem_to_loc(i * g_els, scales.shape(), scales.strides()),
+        biases_ptr + elem_to_loc(i * g_els, biases.shape(), biases.strides()),
+        M,
+        N,
+        K,
+        bits,
+        group_size,
+        transposed_w);
   }
 }
 
-void _bs_qmm_dispatch(
+void _qmm_dispatch(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    int bits,
+    int group_size,
+    bool transposed_w) {
+  switch (x.dtype()) {
+    case float32:
+      _qmm_dispatch_typed<float>(
+          out, x, w, scales, biases, bits, group_size, transposed_w);
+      break;
+    case float16:
+      _qmm_dispatch_typed<float16_t>(
+          out, x, w, scales, biases, bits, group_size, transposed_w);
+      break;
+    case bfloat16:
+      _qmm_dispatch_typed<bfloat16_t>(
+          out, x, w, scales, biases, bits, group_size, transposed_w);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[quantized_matmul] only floating types are supported");
+  }
+}
+
+template <typename T>
+void _bs_qmm_dispatch_typed(
     array& out,
     const array& x,
     const array& w,
@@ -402,60 +402,90 @@ void _bs_qmm_dispatch(
   int w_els = w.shape(-1) * w.shape(-2);
   int g_els = scales.shape(-1) * scales.shape(-2);
 
-  const uint32_t* lhs_indices_data = lhs_indices.data<uint32_t>();
-  const uint32_t* rhs_indices_data = rhs_indices.data<uint32_t>();
+  auto out_ptr = out.data<T>();
+  auto x_ptr = x.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  auto scales_ptr = scales.data<T>();
+  auto biases_ptr = biases.data<T>();
+  auto lhs_indices_ptr = lhs_indices.data<uint32_t>();
+  auto rhs_indices_ptr = rhs_indices.data<uint32_t>();
 
   for (int i = 0; i < lhs_indices.size(); i++) {
-    int x_idx = lhs_indices_data[elem_to_loc(i, lhs_indices)];
-    int w_idx = rhs_indices_data[elem_to_loc(i, rhs_indices)];
+    int x_idx = lhs_indices_ptr[elem_to_loc(
+        i, lhs_indices.shape(), lhs_indices.strides())];
+    int w_idx = rhs_indices_ptr[elem_to_loc(
+        i, rhs_indices.shape(), rhs_indices.strides())];
+    _qmm_dispatch_typed<T>(
+        out_ptr + i * M * N,
+        x_ptr + elem_to_loc(x_idx * M * K, x.shape(), x.strides()),
+        w_ptr + elem_to_loc(w_idx * w_els, w.shape(), w.strides()),
+        scales_ptr +
+            elem_to_loc(w_idx * g_els, scales.shape(), scales.strides()),
+        biases_ptr +
+            elem_to_loc(w_idx * g_els, biases.shape(), biases.strides()),
+        M,
+        N,
+        K,
+        bits,
+        group_size,
+        transposed_w);
+  }
+}
 
-    switch (x.dtype()) {
-      case float32:
-        _qmm_dispatch_typed<float>(
-            out.data<float>() + i * M * N,
-            x.data<float>() + elem_to_loc(x_idx * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(w_idx * w_els, w),
-            scales.data<float>() + elem_to_loc(w_idx * g_els, scales),
-            biases.data<float>() + elem_to_loc(w_idx * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      case float16:
-        _qmm_dispatch_typed<float16_t>(
-            out.data<float16_t>() + i * M * N,
-            x.data<float16_t>() + elem_to_loc(x_idx * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(w_idx * w_els, w),
-            scales.data<float16_t>() + elem_to_loc(w_idx * g_els, scales),
-            biases.data<float16_t>() + elem_to_loc(w_idx * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      case bfloat16:
-        _qmm_dispatch_typed<bfloat16_t>(
-            out.data<bfloat16_t>() + i * M * N,
-            x.data<bfloat16_t>() + elem_to_loc(x_idx * M * K, x),
-            w.data<uint32_t>() + elem_to_loc(w_idx * w_els, w),
-            scales.data<bfloat16_t>() + elem_to_loc(w_idx * g_els, scales),
-            biases.data<bfloat16_t>() + elem_to_loc(w_idx * g_els, biases),
-            M,
-            N,
-            K,
-            bits,
-            group_size,
-            transposed_w);
-        break;
-      default:
-        throw std::invalid_argument(
-            "[quantized_matmul] only floating types are supported");
-    }
+void _bs_qmm_dispatch(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    int bits,
+    int group_size,
+    bool transposed_w) {
+  switch (x.dtype()) {
+    case float32:
+      _bs_qmm_dispatch_typed<float>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          bits,
+          group_size,
+          transposed_w);
+      break;
+    case float16:
+      _bs_qmm_dispatch_typed<float16_t>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          bits,
+          group_size,
+          transposed_w);
+      break;
+    case bfloat16:
+      _bs_qmm_dispatch_typed<bfloat16_t>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          bits,
+          group_size,
+          transposed_w);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[quantized_matmul] only floating types are supported");
   }
 }
 
@@ -469,13 +499,14 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto& scales_pre = inputs[2];
   auto& biases_pre = inputs[3];
 
-  auto ensure_row_contiguous = [](const array& arr) {
+  std::vector<array> temps;
+  auto ensure_row_contiguous = [s = stream(), &temps](const array& arr) {
     if (arr.flags().row_contiguous) {
       return arr;
     } else {
-      array arr_copy(arr.shape(), arr.dtype(), nullptr, {});
-      copy(arr, arr_copy, CopyType::General);
-      return arr_copy;
+      temps.push_back(array(arr.shape(), arr.dtype(), nullptr, {}));
+      copy(arr, temps.back(), CopyType::General, s);
+      return temps.back();
     }
   };
 
@@ -484,8 +515,25 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto scales = ensure_row_contiguous(scales_pre);
   auto biases = ensure_row_contiguous(biases_pre);
 
-  out.set_data(allocator::malloc_or_wait(out.nbytes()));
-  _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  auto& encoder = cpu::get_command_encoder(stream());
+  encoder.add_temporaries(std::move(temps));
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(scales);
+  encoder.set_input_array(biases);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = array::unsafe_weak_copy(out),
+                    x = array::unsafe_weak_copy(x),
+                    w = array::unsafe_weak_copy(w),
+                    scales = array::unsafe_weak_copy(scales),
+                    biases = array::unsafe_weak_copy(biases),
+                    group_size_ = group_size_,
+                    bits_ = bits_,
+                    transpose_ = transpose_]() mutable {
+    _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+  });
 }
 
 void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
@@ -498,15 +546,17 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto& lhs_indices = inputs[4];
   auto& rhs_indices = inputs[5];
 
-  auto ensure_row_contiguous_last_dims = [](const array& arr) {
+  std::vector<array> temps;
+  auto ensure_row_contiguous_last_dims = [s = stream(),
+                                          &temps](const array& arr) {
     auto stride_0 = arr.strides()[arr.ndim() - 2];
     auto stride_1 = arr.strides()[arr.ndim() - 1];
     if (stride_0 == arr.shape(-1) && stride_1 == 1) {
       return arr;
     } else {
-      array arr_copy(arr.shape(), arr.dtype(), nullptr, {});
-      copy(arr, arr_copy, CopyType::General);
-      return arr_copy;
+      temps.push_back(array(arr.shape(), arr.dtype(), nullptr, {}));
+      copy(arr, temps.back(), CopyType::General, s);
+      return temps.back();
     }
   };
 
@@ -515,71 +565,86 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto scales = ensure_row_contiguous_last_dims(scales_pre);
   auto biases = ensure_row_contiguous_last_dims(biases_pre);
 
-  out.set_data(allocator::malloc_or_wait(out.nbytes()));
-  _bs_qmm_dispatch(
-      out,
-      x,
-      w,
-      scales,
-      biases,
-      lhs_indices,
-      rhs_indices,
-      group_size_,
-      bits_,
-      transpose_);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  auto& encoder = cpu::get_command_encoder(stream());
+  encoder.add_temporaries(std::move(temps));
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(scales);
+  encoder.set_input_array(biases);
+  encoder.set_input_array(lhs_indices);
+  encoder.set_input_array(rhs_indices);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = array::unsafe_weak_copy(out),
+                    x = array::unsafe_weak_copy(x),
+                    w = array::unsafe_weak_copy(w),
+                    scales = array::unsafe_weak_copy(scales),
+                    biases = array::unsafe_weak_copy(biases),
+                    lhs_indices = array::unsafe_weak_copy(lhs_indices),
+                    rhs_indices = array::unsafe_weak_copy(rhs_indices),
+                    group_size_ = group_size_,
+                    bits_ = bits_,
+                    transpose_ = transpose_]() mutable {
+    _bs_qmm_dispatch(
+        out,
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        group_size_,
+        bits_,
+        transpose_);
+  });
 }
 
 template <typename T, typename U>
 void quantize(
-    const array& w_,
-    array& out_,
-    array& scales_,
-    array& biases_,
+    const T* w,
+    U* out,
+    T* scales,
+    T* biases,
     int bits,
-    int group_size) {
-  const T* w = w_.data<T>();
+    int group_size,
+    size_t w_size) {
+  float n_bins = (1 << bits) - 1;
+  float eps = 1e-7;
 
-  auto out = out_.data<U>();
-  T* scales = scales_.data<T>();
-  T* biases = biases_.data<T>();
-
-  T n_bins = (1 << bits) - 1;
-  T eps = 1e-7;
   bool power_of_2_bits = is_power_of_2(bits);
   int el_per_int = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
   // For 3/6 bits we read 3 uint8s at a time instead of 1 uint32
   int bytes_per_pack = power_of_2_bits ? 1 : 3;
   int int_per_group = group_size * bytes_per_pack / el_per_int;
-  size_t n_groups = w_.size() / group_size;
+  size_t n_groups = w_size / group_size;
 
   for (size_t i = 0; i < n_groups; ++i) {
     size_t w_idx = i * group_size;
-    T w_min = std::numeric_limits<float>::infinity();
-    T w_max = -w_min;
+    float w_min = std::numeric_limits<float>::infinity();
+    float w_max = -w_min;
     for (int j = 0; j < group_size; ++j) {
-      w_max = std::max(w_max, w[w_idx + j]);
-      w_min = std::min(w_min, w[w_idx + j]);
+      w_max = std::max(w_max, (float)w[w_idx + j]);
+      w_min = std::min(w_min, (float)w[w_idx + j]);
     }
     bool mask = std::abs(w_min) > std::abs(w_max);
-    T scale = std::max(T((w_max - w_min) / n_bins), eps);
+    float scale = std::max((w_max - w_min) / n_bins, eps);
     scale = mask ? scale : -scale;
 
-    auto edge = mask ? w_min : w_max;
-    auto q0 = std::rint(edge / scale);
-    if (q0 == 0) {
-      scales[i] = scale;
-      biases[i] = 0;
-    } else {
-      scales[i] = edge / q0;
-      biases[i] = edge;
+    float edge = mask ? w_min : w_max;
+    float q0 = std::rint(edge / scale);
+    float bias = 0;
+    if (q0 != 0) {
+      scale = edge / q0;
+      bias = edge;
     }
     size_t out_idx = i * int_per_group;
     for (int j = 0; j < int_per_group / bytes_per_pack; ++j) {
       uint32_t out_el = 0;
       for (int k = 0; k < el_per_int; ++k) {
-        T w_el = w[w_idx + j * el_per_int + k];
-        w_el = std::rint((w_el - biases[i]) / scales[i]);
-        w_el = std::min(std::max(w_el, T(0)), n_bins);
+        float w_el = w[w_idx + j * el_per_int + k];
+        w_el = std::rint((w_el - bias) / scale);
+        w_el = std::min(std::max(w_el, 0.0f), n_bins);
         out_el |= static_cast<uint32_t>(w_el) << (k * bits);
       }
       if (power_of_2_bits) {
@@ -590,53 +655,91 @@ void quantize(
         out[out_idx + bytes_per_pack * j + 2] = (out_el & 0xff0000) >> 16;
       }
     }
+    scales[i] = static_cast<T>(scale);
+    biases[i] = static_cast<T>(bias);
   }
+}
+
+template <typename T, typename U>
+void dispatch_quantize(
+    const array& w,
+    array& out,
+    array& scales,
+    array& biases,
+    int bits,
+    int group_size) {
+  auto w_ptr = w.data<T>();
+  auto out_ptr = out.data<U>();
+  auto scales_ptr = scales.data<T>();
+  auto biases_ptr = biases.data<T>();
+  quantize<T, U>(
+      w_ptr, out_ptr, scales_ptr, biases_ptr, bits, group_size, w.size());
 }
 
 void fast::AffineQuantize::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  auto ensure_row_contiguous = [](const array& arr) {
+  auto ensure_row_contiguous = [s = stream()](const array& arr) {
     if (arr.flags().row_contiguous) {
-      return arr;
+      return std::make_pair(arr, false);
     } else {
       array arr_copy(arr.shape(), arr.dtype(), nullptr, {});
-      copy(arr, arr_copy, CopyType::General);
-      return arr_copy;
+      copy(arr, arr_copy, CopyType::General, s);
+      return std::make_pair(arr_copy, true);
     }
   };
-  auto w = ensure_row_contiguous(inputs[0]);
 
+  auto [w, copied] = ensure_row_contiguous(inputs[0]);
   auto& out = outputs[0];
-  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  out.set_data(allocator::malloc(out.nbytes()));
 
   auto& scales = outputs[1];
   auto& biases = outputs[2];
-  scales.set_data(allocator::malloc_or_wait(scales.nbytes()));
-  biases.set_data(allocator::malloc_or_wait(biases.nbytes()));
-  if (w.dtype() == float16) {
-    if (is_power_of_2(bits_)) {
-      quantize<float16_t, uint32_t>(w, out, scales, biases, bits_, group_size_);
-    } else {
-      quantize<float16_t, uint8_t>(w, out, scales, biases, bits_, group_size_);
-    }
-  } else if (w.dtype() == bfloat16) {
-    if (is_power_of_2(bits_)) {
-      quantize<bfloat16_t, uint32_t>(
-          w, out, scales, biases, bits_, group_size_);
-    } else {
-      quantize<bfloat16_t, uint8_t>(w, out, scales, biases, bits_, group_size_);
-    }
-  } else if (w.dtype() == float32) {
-    if (is_power_of_2(bits_)) {
-      quantize<float, uint32_t>(w, out, scales, biases, bits_, group_size_);
-    } else {
-      quantize<float, uint8_t>(w, out, scales, biases, bits_, group_size_);
-    }
-  } else {
-    throw std::runtime_error(
-        "[fast::AffineQuantize::eval_cpu] Only supports floating point inputs");
+  scales.set_data(allocator::malloc(scales.nbytes()));
+  biases.set_data(allocator::malloc(biases.nbytes()));
+  auto& encoder = cpu::get_command_encoder(stream());
+  if (copied) {
+    encoder.add_temporary(w);
   }
+  encoder.set_input_array(w);
+  encoder.set_input_array(scales);
+  encoder.set_input_array(biases);
+  encoder.set_output_array(out);
+  encoder.dispatch([w = array::unsafe_weak_copy(w),
+                    out = array::unsafe_weak_copy(out),
+                    scales = array::unsafe_weak_copy(scales),
+                    biases = array::unsafe_weak_copy(biases),
+                    group_size_ = group_size_,
+                    bits_ = bits_]() mutable {
+    if (w.dtype() == float16) {
+      if (is_power_of_2(bits_)) {
+        dispatch_quantize<float16_t, uint32_t>(
+            w, out, scales, biases, bits_, group_size_);
+      } else {
+        dispatch_quantize<float16_t, uint8_t>(
+            w, out, scales, biases, bits_, group_size_);
+      }
+    } else if (w.dtype() == bfloat16) {
+      if (is_power_of_2(bits_)) {
+        dispatch_quantize<bfloat16_t, uint32_t>(
+            w, out, scales, biases, bits_, group_size_);
+      } else {
+        dispatch_quantize<bfloat16_t, uint8_t>(
+            w, out, scales, biases, bits_, group_size_);
+      }
+    } else if (w.dtype() == float32) {
+      if (is_power_of_2(bits_)) {
+        dispatch_quantize<float, uint32_t>(
+            w, out, scales, biases, bits_, group_size_);
+      } else {
+        dispatch_quantize<float, uint8_t>(
+            w, out, scales, biases, bits_, group_size_);
+      }
+    } else {
+      throw std::runtime_error(
+          "[fast::AffineQuantize::eval_cpu] Only supports floating point inputs");
+    }
+  });
 }
 
 } // namespace mlx::core

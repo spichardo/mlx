@@ -1,9 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdlib>
+#include <filesystem>
 #include <sstream>
-
-#include <sys/sysctl.h>
 
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
@@ -11,15 +10,14 @@
 
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
-#include "mlx/backend/metal/metal_impl.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/utils.h"
+
+namespace fs = std::filesystem;
 
 namespace mlx::core::metal {
 
 namespace {
-
-// TODO nicer way to set this or possibly expose as an environment variable
-constexpr int MAX_BUFFERS_PER_QUEUE = 12;
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -57,7 +55,10 @@ std::pair<MTL::Library*, NS::Error*> load_library_from_path(
 }
 
 #ifdef SWIFTPM_BUNDLE
-MTL::Library* try_load_bundle(MTL::Device* device, NS::URL* url) {
+MTL::Library* try_load_bundle(
+    MTL::Device* device,
+    NS::URL* url,
+    const std::string& lib_name) {
   std::string bundle_path = std::string(url->fileSystemRepresentation()) + "/" +
       SWIFTPM_BUNDLE + ".bundle";
   auto bundle = NS::Bundle::alloc()->init(
@@ -65,7 +66,7 @@ MTL::Library* try_load_bundle(MTL::Device* device, NS::URL* url) {
   if (bundle != nullptr) {
     std::string resource_path =
         std::string(bundle->resourceURL()->fileSystemRepresentation()) + "/" +
-        "default.metallib";
+        lib_name + ".metallib";
     auto [lib, error] = load_library_from_path(device, resource_path.c_str());
     if (lib) {
       return lib;
@@ -75,57 +76,139 @@ MTL::Library* try_load_bundle(MTL::Device* device, NS::URL* url) {
 }
 #endif
 
+// Firstly, search for the metallib in the same path as this binary
+std::pair<MTL::Library*, NS::Error*> load_colocated_library(
+    MTL::Device* device,
+    const std::string& relative_path) {
+  std::string binary_dir = get_binary_directory();
+  if (binary_dir.size() == 0) {
+    return {nullptr, nullptr};
+  }
+
+  auto path = fs::path(binary_dir) / relative_path;
+  if (!path.has_extension()) {
+    path.replace_extension(".metallib");
+  }
+
+  return load_library_from_path(device, path.c_str());
+}
+
+std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
+    MTL::Device* device,
+    const std::string& lib_name) {
+#ifdef SWIFTPM_BUNDLE
+  MTL::Library* library =
+      try_load_bundle(device, NS::Bundle::mainBundle()->bundleURL(), lib_name);
+  if (library != nullptr) {
+    return {library, nullptr};
+  }
+  auto bundles = NS::Bundle::allBundles();
+  for (int i = 0, c = (int)bundles->count(); i < c; i++) {
+    auto bundle = reinterpret_cast<NS::Bundle*>(bundles->object(i));
+    library = try_load_bundle(device, bundle->resourceURL(), lib_name);
+    if (library != nullptr) {
+      return {library, nullptr};
+    }
+  }
+#endif
+  return {nullptr, nullptr};
+}
+
+MTL::Library* load_default_library(MTL::Device* device) {
+  NS::Error* error[4];
+  MTL::Library* lib;
+  // First try the colocated mlx.metallib
+  std::tie(lib, error[0]) = load_colocated_library(device, "mlx");
+  if (lib) {
+    return lib;
+  }
+
+  std::tie(lib, error[1]) = load_colocated_library(device, "Resources/mlx");
+  if (lib) {
+    return lib;
+  }
+
+  // Then try default.metallib in a SwiftPM bundle if we have one
+  std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
+  if (lib) {
+    return lib;
+  }
+
+  // Finally try default_mtllib_path
+  std::tie(lib, error[3]) = load_library_from_path(device, default_mtllib_path);
+  if (!lib) {
+    std::ostringstream msg;
+    msg << "Failed to load the default metallib. ";
+    for (int i = 0; i < 4; i++) {
+      if (error[i] != nullptr) {
+        msg << error[i]->localizedDescription()->utf8String() << " ";
+      }
+    }
+    throw std::runtime_error(msg.str());
+  }
+  return lib;
+}
+
 MTL::Library* load_library(
     MTL::Device* device,
-    const std::string& lib_name = "mlx",
-    const char* lib_path = default_mtllib_path) {
-  // Firstly, search for the metallib in the same path as this binary
-  std::string first_path = get_colocated_mtllib_path(lib_name);
-  if (first_path.size() != 0) {
-    auto [lib, error] = load_library_from_path(device, first_path.c_str());
+    const std::string& lib_name,
+    const std::string& lib_path) {
+  // We have been given a path that ends in metallib so try to load it
+  if (lib_path.size() > 9 &&
+      std::equal(lib_path.end() - 9, lib_path.end(), ".metallib")) {
+    auto [lib, error] = load_library_from_path(device, lib_path.c_str());
+    if (!lib) {
+      std::ostringstream msg;
+      msg << "Failed to load the metallib from <" << lib_path << "> with error "
+          << error->localizedDescription()->utf8String();
+      throw std::runtime_error(msg.str());
+    }
+    return lib;
+  }
+
+  // We have been given a path so try to load from lib_path / lib_name.metallib
+  if (lib_path.size() > 0) {
+    std::string full_path = lib_path + "/" + lib_name + ".metallib";
+    auto [lib, error] = load_library_from_path(device, full_path.c_str());
+    if (!lib) {
+      std::ostringstream msg;
+      msg << "Failed to load the metallib from <" << full_path
+          << "> with error " << error->localizedDescription()->utf8String();
+      throw std::runtime_error(msg.str());
+    }
+    return lib;
+  }
+
+  // Try to load the colocated library
+  {
+    auto [lib, error] = load_colocated_library(device, lib_name);
     if (lib) {
       return lib;
     }
   }
 
-#ifdef SWIFTPM_BUNDLE
-  // try to load from a swiftpm resource bundle -- scan the available bundles to
-  // find one that contains the named bundle
+  // Try to load the library from swiftpm
   {
-    MTL::Library* library =
-        try_load_bundle(device, NS::Bundle::mainBundle()->bundleURL());
-    if (library != nullptr) {
-      return library;
-    }
-    auto bundles = NS::Bundle::allBundles();
-    for (int i = 0, c = (int)bundles->count(); i < c; i++) {
-      auto bundle = reinterpret_cast<NS::Bundle*>(bundles->object(i));
-      library = try_load_bundle(device, bundle->resourceURL());
-      if (library != nullptr) {
-        return library;
-      }
+    auto [lib, error] = load_swiftpm_library(device, lib_name);
+    if (lib) {
+      return lib;
     }
   }
-#endif
 
-  // Couldn't find it so let's load it from default_mtllib_path
-  {
-    auto [lib, error] = load_library_from_path(device, lib_path);
-    if (!lib) {
-      std::ostringstream msg;
-      msg << error->localizedDescription()->utf8String() << "\n"
-          << "Failed to load device library from <" << lib_path << ">"
-          << " or <" << first_path << ">.";
-      throw std::runtime_error(msg.str());
-    }
-    return lib;
-  }
+  std::ostringstream msg;
+  msg << "Failed to load the metallib " << lib_name << ".metallib. "
+      << "We attempted to load it from <" << get_binary_directory() << "/"
+      << lib_name << ".metallib" << ">";
+#ifdef SWIFTPM_BUNDLE
+  msg << " and from the Swift PM bundle.";
+#endif
+  throw std::runtime_error(msg.str());
 }
 
 } // namespace
 
-CommandEncoder::CommandEncoder(MTL::CommandBuffer* cbuf) {
-  enc_ = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+CommandEncoder::CommandEncoder(DeviceStream& stream) : stream_(stream) {
+  enc_ = stream_.buffer->computeCommandEncoder(MTL::DispatchTypeConcurrent);
   enc_->retain();
 }
 
@@ -145,7 +228,9 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
-  all_inputs_.insert(a.buffer().ptr());
+  if (all_inputs_.insert(a.buffer().ptr()).second) {
+    stream_.buffer_sizes += a.data_size();
+  }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   needs_barrier_ =
       needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
@@ -165,9 +250,10 @@ void CommandEncoder::set_output_array(
   register_output_array(a);
 }
 
-void CommandEncoder::register_output_array(array& a) {
+void CommandEncoder::register_output_array(const array& a) {
   all_outputs_.insert(a.buffer().ptr());
-  auto buf = static_cast<MTL::Resource*>(a.buffer().ptr());
+
+  auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   if (concurrent_) {
     concurrent_outputs_.insert(buf);
   } else {
@@ -190,6 +276,7 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
   maybeInsertBarrier();
+  stream_.buffer_ops++;
   enc_->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -197,6 +284,7 @@ void CommandEncoder::dispatch_threads(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
   maybeInsertBarrier();
+  stream_.buffer_ops++;
   enc_->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -207,8 +295,33 @@ void CommandEncoder::barrier() {
 Device::Device() {
   auto pool = new_scoped_memory_pool();
   device_ = load_device();
-  library_map_ = {{"mlx", load_library(device_)}};
+  library_map_ = {{"mlx", load_default_library(device_)}};
   arch_ = std::string(device_->architecture()->name()->utf8String());
+  auto arch = arch_.back();
+  switch (arch) {
+    case 'p': // phone
+      max_ops_per_buffer_ = 20;
+      max_mb_per_buffer_ = 40;
+      break;
+    case 'g': // base, pro
+      max_ops_per_buffer_ = 40;
+      max_mb_per_buffer_ = 40;
+      break;
+    case 's': // max
+      max_ops_per_buffer_ = 50;
+      max_mb_per_buffer_ = 50;
+      break;
+    case 'd': // ultra
+      max_ops_per_buffer_ = 50;
+      max_mb_per_buffer_ = 50;
+      break;
+    default: // default to medium
+      max_ops_per_buffer_ = 40;
+      max_mb_per_buffer_ = 40;
+      break;
+  }
+  max_ops_per_buffer_ = env::max_ops_per_buffer(max_ops_per_buffer_);
+  max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
 }
 
 Device::~Device() {
@@ -219,15 +332,13 @@ Device::~Device() {
   for (auto& l : library_map_) {
     l.second->release();
   }
+  stream_map_.clear();
   device_->release();
 }
 
 void Device::new_queue(int index) {
   auto thread_pool = metal::new_scoped_memory_pool();
-
-  // Multiple threads can ask the device for queues
-  // We lock this as a critical section for safety
-  auto q = device_->newCommandQueue(MAX_BUFFERS_PER_QUEUE);
+  auto q = device_->newCommandQueue();
   debug_set_stream_queue_label(q, index);
   if (!q) {
     throw std::runtime_error(
@@ -239,12 +350,17 @@ void Device::new_queue(int index) {
   }
 }
 
-int Device::get_command_buffer_ops(int index) {
-  return get_stream_(index).buffer_ops;
+MTL::CommandQueue* Device::get_queue(Stream stream) {
+  return get_stream_(stream.index).queue;
 }
 
-void Device::increment_command_buffer_ops(int index) {
-  get_stream_(index).buffer_ops++;
+bool Device::command_buffer_needs_commit(int index) {
+  auto& stream = get_stream_(index);
+  if (stream.buffer_ops > max_ops_per_buffer_ ||
+      (stream.buffer_sizes >> 20) > max_mb_per_buffer_) {
+    return true;
+  }
+  return false;
 }
 
 MTL::CommandBuffer* Device::get_command_buffer(int index) {
@@ -267,6 +383,7 @@ void Device::commit_command_buffer(int index) {
   stream.buffer->release();
   stream.buffer = nullptr;
   stream.buffer_ops = 0;
+  stream.buffer_sizes = 0;
 }
 
 void Device::add_temporary(array arr, int index) {
@@ -351,7 +468,7 @@ void Device::end_encoding(int index) {
 CommandEncoder& Device::get_command_encoder(int index) {
   auto& stream = get_stream_(index);
   if (stream.encoder == nullptr) {
-    stream.encoder = std::make_unique<CommandEncoder>(stream.buffer);
+    stream.encoder = std::make_unique<CommandEncoder>(stream);
     stream.fence = std::make_shared<Fence>(device_->newFence());
   }
   return *stream.encoder;
@@ -650,42 +767,6 @@ std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool() {
   };
   return std::unique_ptr<void, std::function<void(void*)>>(
       NS::AutoreleasePool::alloc()->init(), dtor);
-}
-
-void new_stream(Stream stream) {
-  if (stream.device == mlx::core::Device::gpu) {
-    device(stream.device).new_queue(stream.index);
-  }
-}
-
-std::unordered_map<std::string, std::variant<std::string, size_t>>
-device_info() {
-  auto init_device_info = []()
-      -> std::unordered_map<std::string, std::variant<std::string, size_t>> {
-    auto pool = new_scoped_memory_pool();
-    auto raw_device = device(default_device()).mtl_device();
-    auto arch = std::string(raw_device->architecture()->name()->utf8String());
-
-    size_t memsize = 0;
-    size_t length = sizeof(memsize);
-    sysctlbyname("hw.memsize", &memsize, &length, NULL, 0);
-
-    size_t rsrc_limit = 0;
-    sysctlbyname("iogpu.rsrc_limit", &rsrc_limit, &length, NULL, 0);
-    if (rsrc_limit == 0) {
-      rsrc_limit = 499000;
-    }
-
-    return {
-        {"architecture", arch},
-        {"max_buffer_length", raw_device->maxBufferLength()},
-        {"max_recommended_working_set_size",
-         raw_device->recommendedMaxWorkingSetSize()},
-        {"memory_size", memsize},
-        {"resource_limit", rsrc_limit}};
-  };
-  static auto device_info_ = init_device_info();
-  return device_info_;
 }
 
 } // namespace mlx::core::metal

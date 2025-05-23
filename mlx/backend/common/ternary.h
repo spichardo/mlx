@@ -36,15 +36,10 @@ inline void set_ternary_op_output_data(
     const array& b,
     const array& c,
     array& out,
-    TernaryOpType topt,
-    bool donate_with_move = false) {
-  auto maybe_donate = [&out, donate_with_move](const array& x) {
+    TernaryOpType topt) {
+  auto maybe_donate = [&out](const array& x) {
     if (is_donatable(x, out)) {
-      if (donate_with_move) {
-        out.move_shared_buffer(x);
-      } else {
-        out.copy_shared_buffer(x);
-      }
+      out.copy_shared_buffer(x);
       return true;
     }
     return false;
@@ -53,12 +48,12 @@ inline void set_ternary_op_output_data(
   switch (topt) {
     case TernaryOpType::ScalarScalarScalar:
       out.set_data(
-          allocator::malloc_or_wait(out.itemsize()), 1, b.strides(), b.flags());
+          allocator::malloc(out.itemsize()), 1, b.strides(), b.flags());
       break;
     case TernaryOpType::VectorVectorVector:
       if (!(maybe_donate(a) || maybe_donate(b) || maybe_donate(c))) {
         out.set_data(
-            allocator::malloc_or_wait(out.itemsize() * b.data_size()),
+            allocator::malloc(out.itemsize() * b.data_size()),
             b.data_size(),
             b.strides(),
             b.flags());
@@ -69,7 +64,7 @@ inline void set_ternary_op_output_data(
       if (!((a.flags().row_contiguous && maybe_donate(a)) ||
             (b.flags().row_contiguous && maybe_donate(b)) ||
             (c.flags().row_contiguous && maybe_donate(c)))) {
-        out.set_data(allocator::malloc_or_wait(out.nbytes()));
+        out.set_data(allocator::malloc(out.nbytes()));
       }
       break;
   }

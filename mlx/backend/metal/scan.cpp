@@ -3,7 +3,7 @@
 #include <cassert>
 #include <sstream>
 
-#include "mlx/backend/metal/copy.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
@@ -17,14 +17,14 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
-  std::vector<array> copies;
+  bool donate = inputs[0].is_donatable();
   auto in = inputs[0];
   if (in.flags().contiguous && in.strides()[axis_] != 0) {
-    if (in.is_donatable() && in.itemsize() == out.itemsize()) {
-      out.move_shared_buffer(in);
+    if (donate && in.itemsize() == out.itemsize()) {
+      out.copy_shared_buffer(in);
     } else {
       out.set_data(
-          allocator::malloc_or_wait(in.data_size() * out.itemsize()),
+          allocator::malloc(in.data_size() * out.itemsize()),
           in.data_size(),
           in.strides(),
           in.flags());
@@ -32,9 +32,8 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   } else {
     array arr_copy(in.shape(), in.dtype(), nullptr, {});
     copy_gpu(in, arr_copy, CopyType::General, s);
-    copies.push_back(arr_copy);
-    in = arr_copy;
-    out.move_shared_buffer(in);
+    in = std::move(arr_copy);
+    out.copy_shared_buffer(in);
   }
 
   bool contiguous = in.strides()[axis_] == 1;
@@ -61,6 +60,9 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
     case Scan::Min:
       reduce_type = "min";
       break;
+    case Scan::LogAddExp:
+      reduce_type = "logaddexp";
+      break;
   }
   kname << reduce_type << "_" << type_to_name(in) << "_" << type_to_name(out);
   auto kernel = get_scan_kernel(
@@ -69,8 +71,7 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (contiguous) {
     auto& compute_encoder = d.get_command_encoder(s.index);
     compute_encoder.set_compute_pipeline_state(kernel);
-    compute_encoder.set_input_array(
-        in.data_shared_ptr() == nullptr ? out : in, 0);
+    compute_encoder.set_input_array(in, 0);
     compute_encoder.set_output_array(out, 1);
     size_t size = in.shape(axis_);
     compute_encoder.set_bytes(size, 2);
@@ -127,8 +128,6 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
     MTL::Size group_dims(thread_group_size, 1, 1);
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-
-  d.add_temporaries(std::move(copies), s.index);
 }
 
 } // namespace mlx::core

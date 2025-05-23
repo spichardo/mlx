@@ -199,6 +199,13 @@ class array {
       const std::shared_ptr<Primitive>& primitive,
       const std::vector<array>& inputs);
 
+  /**
+   * Get a new array that refers to the same data as the input but with a
+   * non-owning pointer to it. Note the array is detached from the graph and has
+   * no inputs, siblings or primitive.
+   */
+  static array unsafe_weak_copy(const array& other);
+
   /** A unique identifier for an array. */
   std::uintptr_t id() const {
     return reinterpret_cast<std::uintptr_t>(array_desc_.get());
@@ -217,6 +224,10 @@ class array {
     // Not copyable
     Data(const Data& d) = delete;
     Data& operator=(const Data& d) = delete;
+    Data(Data&& o) : buffer(o.buffer), d(o.d) {
+      o.buffer = allocator::Buffer(nullptr);
+      o.d = [](allocator::Buffer) {};
+    }
     ~Data() {
       d(buffer);
     }
@@ -332,11 +343,11 @@ class array {
     return allocator::allocator().size(buffer());
   }
 
-  // Return a copy of the shared pointer
-  // to the array::Data struct
-  std::shared_ptr<Data> data_shared_ptr() const {
+  // Return the shared pointer to the array::Data struct
+  const std::shared_ptr<Data>& data_shared_ptr() const {
     return array_desc_->data;
   }
+
   // Return a raw pointer to the arrays data
   template <typename T>
   T* data() {
@@ -349,14 +360,9 @@ class array {
   }
 
   enum Status {
-    // The ouptut of a computation which has not been scheduled.
+    // The output of a computation which has not been scheduled.
     // For example, the status of `x` in `auto x = a + b`.
     unscheduled,
-
-    // The ouptut of a computation which has been scheduled but `eval_*` has
-    // not yet been called on the array's primitive. A possible
-    // status of `x` in `auto x = a + b; eval(x);`
-    scheduled,
 
     // The array's `eval_*` function has been run, but the computation is not
     // necessarily complete. The array will have memory allocated and if it is
@@ -394,6 +400,10 @@ class array {
     array_desc_->event = std::move(e);
   }
 
+  void detach_event() const {
+    array_desc_->event = Event{};
+  }
+
   // Mark the array as a tracer array (true) or not.
   void set_tracer(bool is_tracer) {
     array_desc_->is_tracer = is_tracer;
@@ -418,15 +428,6 @@ class array {
       size_t offset = 0);
 
   void copy_shared_buffer(const array& other);
-
-  void move_shared_buffer(
-      array other,
-      const Strides& strides,
-      Flags flags,
-      size_t data_size,
-      size_t offset = 0);
-
-  void move_shared_buffer(array other);
 
   void overwrite_descriptor(const array& other) {
     array_desc_ = other.array_desc_;
@@ -593,6 +594,9 @@ void array::init(It src) {
       break;
     case float32:
       std::copy(src, src + size(), data<float>());
+      break;
+    case float64:
+      std::copy(src, src + size(), data<double>());
       break;
     case bfloat16:
       std::copy(src, src + size(), data<bfloat16_t>());

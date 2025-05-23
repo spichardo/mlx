@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mlx/array.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
@@ -59,14 +61,35 @@ inline void debug_set_primitive_buffer_label(
 std::string get_primitive_string(Primitive* primitive);
 
 template <typename T>
+constexpr bool is_numeric_except_char = std::is_arithmetic_v<T> &&
+    !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
+    !std::is_same_v<T, unsigned char> && !std::is_same_v<T, wchar_t>;
+
+template <typename T>
 void concatenate(std::string& acc, T first) {
-  acc += first;
+  if constexpr (is_numeric_except_char<T>) {
+    acc += std::to_string(first);
+  } else {
+    acc += first;
+  }
 }
 
 template <typename T, typename... Args>
 void concatenate(std::string& acc, T first, Args... args) {
-  acc += first;
+  if constexpr (is_numeric_except_char<T>) {
+    acc += std::to_string(first);
+  } else {
+    acc += first;
+  }
   concatenate(acc, args...);
+}
+
+inline int get_work_per_thread(Dtype dtype) {
+  return std::max(1, 8 / dtype.size());
+}
+
+inline size_t ceildiv(size_t n, size_t m) {
+  return (n + m - 1) / m;
 }
 
 } // namespace mlx::core

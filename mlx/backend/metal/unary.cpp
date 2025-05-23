@@ -1,5 +1,4 @@
 // Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
@@ -35,21 +34,22 @@ void unary_op_gpu_inplace(
   };
   auto [shape, strides] = maybe_collapse();
   int ndim = shape.size();
-  size_t nthreads = contig ? in.data_size() : in.size();
   bool large;
   if (!contig) {
     large = in.data_size() > INT32_MAX || out.size() > INT32_MAX;
   } else {
     large = in.data_size() > UINT32_MAX;
   }
-  int work_per_thread = !contig && large ? 4 : 1;
+  int work_per_thread;
   std::string kernel_name;
   if (contig) {
+    work_per_thread = get_work_per_thread(in.dtype());
     kernel_name = (large ? "v2" : "v");
   } else {
+    work_per_thread = large ? 4 : 1;
     kernel_name = "gn" + std::to_string(work_per_thread);
     if (large) {
-      kernel_name += "_large";
+      kernel_name += "large";
     }
   }
   concatenate(kernel_name, "_", op, type_to_name(in), type_to_name(out));
@@ -58,8 +58,7 @@ void unary_op_gpu_inplace(
   auto thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
   auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
-  compute_encoder.set_input_array(
-      in.data_shared_ptr() == nullptr ? out : in, 0);
+  compute_encoder.set_input_array(in, 0);
   compute_encoder.set_output_array(out, 1);
   if (!contig) {
     // Launch up to 3D grid of threads
@@ -77,12 +76,20 @@ void unary_op_gpu_inplace(
     MTL::Size grid_dims = MTL::Size(dim0, dim1, rest);
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   } else {
+    size_t nthreads = ceildiv(in.data_size(), work_per_thread);
     if (thread_group_size > nthreads) {
       thread_group_size = nthreads;
     }
+
     MTL::Size group_dims = MTL::Size(thread_group_size, 1, 1);
-    MTL::Size grid_dims = large ? get_2d_grid_dims(out.shape(), out.strides())
-                                : MTL::Size(nthreads, 1, 1);
+    MTL::Size grid_dims;
+    if (large) {
+      compute_encoder.set_bytes<int64_t>(in.data_size(), 2);
+      grid_dims = get_2d_grid_dims(out.shape(), out.strides(), work_per_thread);
+    } else {
+      compute_encoder.set_bytes<int>(in.data_size(), 2);
+      grid_dims = MTL::Size(nthreads, 1, 1);
+    }
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 }
@@ -96,16 +103,16 @@ void unary_op_gpu(
   bool contig = in.flags().contiguous;
   if (contig) {
     if (in.is_donatable() && in.itemsize() == out.itemsize()) {
-      out.move_shared_buffer(in);
+      out.copy_shared_buffer(in);
     } else {
       out.set_data(
-          allocator::malloc_or_wait(in.data_size() * out.itemsize()),
+          allocator::malloc(in.data_size() * out.itemsize()),
           in.data_size(),
           in.strides(),
           in.flags());
     }
   } else {
-    out.set_data(allocator::malloc_or_wait(out.nbytes()));
+    out.set_data(allocator::malloc(out.nbytes()));
   }
   unary_op_gpu_inplace(inputs, out, op, s);
 }
@@ -125,6 +132,7 @@ UNARY_GPU(ArcSin)
 UNARY_GPU(ArcSinh)
 UNARY_GPU(ArcTan)
 UNARY_GPU(ArcTanh)
+UNARY_GPU(BitwiseInvert)
 UNARY_GPU(Conjugate)
 UNARY_GPU(Cos)
 UNARY_GPU(Cosh)
@@ -169,7 +177,7 @@ void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
     unary_op_gpu(inputs, out, get_primitive_string(this));
   } else {
     // No-op integer types
-    move_or_copy(in, out);
+    out.copy_shared_buffer(in);
   }
 }
 

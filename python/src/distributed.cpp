@@ -10,6 +10,8 @@
 #include "mlx/distributed/distributed.h"
 #include "mlx/distributed/ops.h"
 
+#include "python/src/utils.h"
+
 namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -66,19 +68,21 @@ void init_distributed(nb::module_& parent_module) {
 
         Example:
 
-          import mlx.core as mx
+          .. code:: python
 
-          group = mx.distributed.init(backend="ring")
+            import mlx.core as mx
 
+            group = mx.distributed.init(backend="ring")
 
         Args:
           strict (bool, optional): If set to False it returns a singleton group
             in case ``mx.distributed.is_available()`` returns False otherwise
             it throws a runtime error. Default: ``False``
-          backend (str, optional): Select a specific distributed backend to
-            initialize. If set to ``any`` then try all available backends and
-            return the first one that succeeds. Subsequent calls will return
-            the first backend that was initialized. Default: ``any``
+          backend (str, optional): Which distributed backend to initialize.
+            Possible values ``mpi``, ``ring``, ``any``. If set to ``any`` all
+            available backends are tried and the first one that succeeds
+            becomes the global group which will be returned in subsequent
+            calls. Default: ``any``
 
         Returns:
           Group: The group representing all the launched processes.
@@ -86,7 +90,11 @@ void init_distributed(nb::module_& parent_module) {
 
   m.def(
       "all_sum",
-      &mx::distributed::all_sum,
+      [](const ScalarOrArray& x,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::all_sum(to_array(x), group, s);
+      },
       "x"_a,
       nb::kw_only(),
       "group"_a = nb::none(),
@@ -109,10 +117,71 @@ void init_distributed(nb::module_& parent_module) {
         Returns:
           array: The sum of all ``x`` arrays.
       )pbdoc");
+  m.def(
+      "all_max",
+      [](const ScalarOrArray& x,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::all_max(to_array(x), group, s);
+      },
+      "x"_a,
+      nb::kw_only(),
+      "group"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def all_max(x: array, *, group: Optional[Group] = None, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        All reduce max.
 
+        Find the maximum of the ``x`` arrays from all processes in the group.
+
+        Args:
+          x (array): Input array.
+          group (Group): The group of processes that will participate in the
+            reduction. If set to ``None`` the global group is used. Default:
+            ``None``.
+          stream (Stream, optional): Stream or device. Defaults to ``None``
+            in which case the default stream of the default device is used.
+
+        Returns:
+          array: The maximum of all ``x`` arrays.
+      )pbdoc");
+  m.def(
+      "all_min",
+      [](const ScalarOrArray& x,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::all_min(to_array(x), group, s);
+      },
+      "x"_a,
+      nb::kw_only(),
+      "group"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def all_min(x: array, *, group: Optional[Group] = None, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+      All reduce min.
+
+      Find the minimum of the ``x`` arrays from all processes in the group.
+
+      Args:
+        x (array): Input array.
+        group (Group): The group of processes that will participate in the
+          reduction. If set to ``None`` the global group is used. Default:
+          ``None``.
+        stream (Stream, optional): Stream or device. Defaults to ``None``
+          in which case the default stream of the default device is used.
+
+      Returns:
+        array: The minimum of all ``x`` arrays.
+    )pbdoc");
   m.def(
       "all_gather",
-      &mx::distributed::all_gather,
+      [](const ScalarOrArray& x,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::all_gather(to_array(x), group, s);
+      },
       "x"_a,
       nb::kw_only(),
       "group"_a = nb::none(),
@@ -139,7 +208,12 @@ void init_distributed(nb::module_& parent_module) {
 
   m.def(
       "send",
-      &mx::distributed::send,
+      [](const ScalarOrArray& x,
+         int dst,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::send(to_array(x), dst, group, s);
+      },
       "x"_a,
       "dst"_a,
       nb::kw_only(),
@@ -195,7 +269,12 @@ void init_distributed(nb::module_& parent_module) {
 
   m.def(
       "recv_like",
-      &mx::distributed::recv_like,
+      [](const ScalarOrArray& x,
+         int src,
+         std::optional<mx::distributed::Group> group,
+         mx::StreamOrDevice s) {
+        return mx::distributed::recv_like(to_array(x), src, group, s);
+      },
       "x"_a,
       "src"_a,
       nb::kw_only(),

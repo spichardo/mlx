@@ -128,6 +128,7 @@ void init_array(nb::module_& m) {
   m.attr("int64") = nb::cast(mx::int64);
   m.attr("float16") = nb::cast(mx::float16);
   m.attr("float32") = nb::cast(mx::float32);
+  m.attr("float64") = nb::cast(mx::float64);
   m.attr("bfloat16") = nb::cast(mx::bfloat16);
   m.attr("complex64") = nb::cast(mx::complex64);
   nb::enum_<mx::Dtype::Category>(
@@ -163,6 +164,7 @@ void init_array(nb::module_& m) {
               * :ref:`float16 <data_types>`
               * :ref:`bfloat16 <data_types>`
               * :ref:`float32 <data_types>`
+              * :ref:`float64 <data_types>`
 
             * :attr:`~mlx.core.complexfloating`
 
@@ -195,11 +197,42 @@ void init_array(nb::module_& m) {
           "max",
           &mx::finfo::max,
           R"pbdoc(The largest representable number.)pbdoc")
+      .def_ro(
+          "eps",
+          &mx::finfo::eps,
+          R"pbdoc(
+            The difference between 1.0 and the next smallest
+            representable number larger than 1.0.
+          )pbdoc")
       .def_ro("dtype", &mx::finfo::dtype, R"pbdoc(The :obj:`Dtype`.)pbdoc")
       .def("__repr__", [](const mx::finfo& f) {
         std::ostringstream os;
         os << "finfo("
            << "min=" << f.min << ", max=" << f.max << ", dtype=" << f.dtype
+           << ")";
+        return os.str();
+      });
+
+  nb::class_<mx::iinfo>(
+      m,
+      "iinfo",
+      R"pbdoc(
+      Get information on integer types.
+      )pbdoc")
+      .def(nb::init<mx::Dtype>())
+      .def_ro(
+          "min",
+          &mx::iinfo::min,
+          R"pbdoc(The smallest representable number.)pbdoc")
+      .def_ro(
+          "max",
+          &mx::iinfo::max,
+          R"pbdoc(The largest representable number.)pbdoc")
+      .def_ro("dtype", &mx::iinfo::dtype, R"pbdoc(The :obj:`Dtype`.)pbdoc")
+      .def("__repr__", [](const mx::iinfo& i) {
+        std::ostringstream os;
+        os << "iinfo("
+           << "min=" << i.min << ", max=" << i.max << ", dtype=" << i.dtype
            << ")";
         return os.str();
       });
@@ -285,6 +318,18 @@ void init_array(nb::module_& m) {
           &mx::array::dtype,
           R"pbdoc(
             The array's :class:`Dtype`.
+          )pbdoc")
+      .def_prop_ro(
+          "real",
+          [](const mx::array& a) { return mx::real(a); },
+          R"pbdoc(
+            The real part of a complex array.
+          )pbdoc")
+      .def_prop_ro(
+          "imag",
+          [](const mx::array& a) { return mx::imag(a); },
+          R"pbdoc(
+            The imaginary part of a complex array.
           )pbdoc")
       .def(
           "item",
@@ -743,11 +788,10 @@ void init_array(nb::module_& m) {
               throw std::invalid_argument(
                   "Floating point types not allowed with bitwise inversion.");
             }
-            if (a.dtype() != mx::bool_) {
-              throw std::invalid_argument(
-                  "Bitwise inversion not yet supported for integer types.");
+            if (a.dtype() == mx::bool_) {
+              return mx::logical_not(a);
             }
-            return mx::logical_not(a);
+            return mx::bitwise_invert(a);
           })
       .def(
           "__and__",
@@ -873,6 +917,38 @@ void init_array(nb::module_& m) {
                   "Floating point types not allowed with right shift.");
             }
             a.overwrite_descriptor(mx::right_shift(a, b));
+            return a;
+          },
+          "other"_a,
+          nb::rv_policy::none)
+      .def(
+          "__xor__",
+          [](const mx::array& a, const ScalarOrArray v) {
+            if (!is_comparable_with_array(v)) {
+              throw_invalid_operation("bitwise xor", v);
+            }
+            auto b = to_array(v, a.dtype());
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
+              throw std::invalid_argument(
+                  "Floating point types not allowed with bitwise xor.");
+            }
+            return mx::bitwise_xor(a, b);
+          },
+          "other"_a)
+      .def(
+          "__ixor__",
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
+            if (!is_comparable_with_array(v)) {
+              throw_invalid_operation("inplace bitwise xor", v);
+            }
+            auto b = to_array(v, a.dtype());
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
+              throw std::invalid_argument(
+                  "Floating point types not allowed bitwise xor.");
+            }
+            a.overwrite_descriptor(mx::bitwise_xor(a, b));
             return a;
           },
           "other"_a,
@@ -1145,6 +1221,28 @@ void init_array(nb::module_& m) {
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`max`.")
+      .def(
+          "logcumsumexp",
+          [](const mx::array& a,
+             std::optional<int> axis,
+             bool reverse,
+             bool inclusive,
+             mx::StreamOrDevice s) {
+            if (axis) {
+              return mx::logcumsumexp(a, *axis, reverse, inclusive, s);
+            } else {
+              // TODO: Implement that in the C++ API as well. See concatenate
+              // above.
+              return mx::logcumsumexp(
+                  mx::reshape(a, {-1}, s), 0, reverse, inclusive, s);
+            }
+          },
+          "axis"_a = nb::none(),
+          nb::kw_only(),
+          "reverse"_a = false,
+          "inclusive"_a = true,
+          "stream"_a = nb::none(),
+          "See :func:`logcumsumexp`.")
       .def(
           "logsumexp",
           [](const mx::array& a,

@@ -569,7 +569,7 @@ inline array std(const array& a, StreamOrDevice s = {}) {
   return std(a, false, 0, to_stream(s));
 }
 
-/** Computes the standard deviatoin of the elements of an array along the given
+/** Computes the standard deviation of the elements of an array along the given
  * axes */
 array std(
     const array& a,
@@ -714,6 +714,14 @@ array topk(const array& a, int k, StreamOrDevice s = {});
 
 /** Returns topk elements of the array along a given axis. */
 array topk(const array& a, int k, int axis, StreamOrDevice s = {});
+
+/** Cumulative logsumexp of an array. */
+array logcumsumexp(
+    const array& a,
+    int axis,
+    bool reverse = false,
+    bool inclusive = true,
+    StreamOrDevice s = {});
 
 /** The logsumexp of all elements of the array. */
 array logsumexp(const array& a, bool keepdims, StreamOrDevice s = {});
@@ -1283,6 +1291,7 @@ array conv_transpose1d(
     int stride = 1,
     int padding = 0,
     int dilation = 1,
+    int output_padding = 0,
     int groups = 1,
     StreamOrDevice s = {});
 
@@ -1293,6 +1302,7 @@ array conv_transpose2d(
     const std::pair<int, int>& stride = {1, 1},
     const std::pair<int, int>& padding = {0, 0},
     const std::pair<int, int>& dilation = {1, 1},
+    const std::pair<int, int>& output_padding = {0, 0},
     int groups = 1,
     StreamOrDevice s = {});
 
@@ -1303,6 +1313,7 @@ array conv_transpose3d(
     const std::tuple<int, int, int>& stride = {1, 1, 1},
     const std::tuple<int, int, int>& padding = {0, 0, 0},
     const std::tuple<int, int, int>& dilation = {1, 1, 1},
+    const std::tuple<int, int, int>& output_padding = {0, 0, 0},
     int groups = 1,
     StreamOrDevice s = {});
 
@@ -1344,6 +1355,7 @@ array gather_qmm(
     bool transpose = true,
     int group_size = 64,
     int bits = 4,
+    bool sorted_indices = false,
     StreamOrDevice s = {});
 
 /** Returns a contraction of a and b over multiple dimensions. */
@@ -1391,6 +1403,7 @@ array gather_mm(
     array b,
     std::optional<array> lhs_indices = std::nullopt,
     std::optional<array> rhs_indices = std::nullopt,
+    bool sorted_indices = false,
     StreamOrDevice s = {});
 
 /** Extract a diagonal or construct a diagonal array */
@@ -1475,6 +1488,10 @@ array operator<<(const array& a, const array& b);
 /** Shift bits to the right. */
 array right_shift(const array& a, const array& b, StreamOrDevice s = {});
 array operator>>(const array& a, const array& b);
+
+/** Invert the bits. */
+array bitwise_invert(const array& a, StreamOrDevice s = {});
+array operator~(const array& a);
 
 array view(const array& a, const Dtype& dtype, StreamOrDevice s = {});
 

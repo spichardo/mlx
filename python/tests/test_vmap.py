@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import gc
 import unittest
 
 import mlx.core as mx
@@ -315,13 +316,17 @@ class TestVmap(mlx_tests.MLXTestCase):
     def test_vmap_svd(self):
         a = mx.random.uniform(shape=(3, 4, 2))
 
-        cpu_svd = lambda x: mx.linalg.svd(x, stream=mx.cpu)
+        cpu_svd_full = lambda x: mx.linalg.svd(x, compute_uv=True, stream=mx.cpu)
+        cpu_svd_singular = lambda x: mx.linalg.svd(x, compute_uv=False, stream=mx.cpu)
 
         # Vmap over the first axis (this is already supported natively by the primitive).
-        Us, Ss, Vts = mx.vmap(cpu_svd, in_axes=(0,))(a)
+        Us, Ss, Vts = mx.vmap(cpu_svd_full, in_axes=(0,))(a)
         self.assertEqual(Us.shape, (a.shape[0], a.shape[1], a.shape[1]))
         self.assertEqual(Ss.shape, (a.shape[0], a.shape[2]))
         self.assertEqual(Vts.shape, (a.shape[0], a.shape[2], a.shape[2]))
+
+        Sv = mx.vmap(cpu_svd_singular, in_axes=(0,))(a)
+        self.assertEqual(Sv.shape, (a.shape[0], a.shape[2]))
 
         for i in range(a.shape[0]):
             M = a[i]
@@ -329,12 +334,23 @@ class TestVmap(mlx_tests.MLXTestCase):
             self.assertTrue(
                 mx.allclose(U[:, : len(S)] @ mx.diag(S) @ Vt, M, rtol=1e-5, atol=1e-7)
             )
+            self.assertTrue(
+                mx.allclose(
+                    mx.linalg.norm(Sv[i]),
+                    mx.linalg.norm(M, ord="fro"),
+                    rtol=1e-5,
+                    atol=1e-7,
+                )
+            )
 
         # Vmap over the second axis.
-        Us, Ss, Vts = mx.vmap(cpu_svd, in_axes=(1,))(a)
+        Us, Ss, Vts = mx.vmap(cpu_svd_full, in_axes=(1,))(a)
         self.assertEqual(Us.shape, (a.shape[1], a.shape[0], a.shape[0]))
         self.assertEqual(Ss.shape, (a.shape[1], a.shape[2]))
         self.assertEqual(Vts.shape, (a.shape[1], a.shape[2], a.shape[2]))
+
+        Sv = mx.vmap(cpu_svd_singular, in_axes=(1,))(a)
+        self.assertEqual(Sv.shape, (a.shape[1], a.shape[2]))
 
         for i in range(a.shape[1]):
             M = a[:, i, :]
@@ -342,8 +358,17 @@ class TestVmap(mlx_tests.MLXTestCase):
             self.assertTrue(
                 mx.allclose(U[:, : len(S)] @ mx.diag(S) @ Vt, M, rtol=1e-5, atol=1e-7)
             )
+            self.assertTrue(
+                mx.allclose(
+                    mx.linalg.norm(Sv[i]),
+                    mx.linalg.norm(M, ord="fro"),
+                    rtol=1e-5,
+                    atol=1e-7,
+                )
+            )
 
     def test_vmap_inverse(self):
+        mx.random.seed(42)
         a = mx.random.uniform(shape=(3, 4, 4))
 
         cpu_inv = lambda x: mx.linalg.inv(x, stream=mx.cpu)
@@ -595,6 +620,106 @@ class TestVmap(mlx_tests.MLXTestCase):
         upd = mx.ones((2, 4, 1))
         out = mx.vmap(fun, in_axes=(None, 1, 1))(a, idx, upd)
         self.assertEqual(out.shape, (4, 5, 1))
+
+    def test_vmap_split_vmap(self):
+        def fun(x):
+            a, b = mx.split(x, 2, 1)
+            return mx.concatenate([b, a], 1)
+
+        x = mx.ones((5, 6, 7))
+        y = mx.ones((5, 4, 6, 7))
+        fx = fun(x)
+        fy = mx.vmap(fun, in_axes=1)(y)
+        self.assertEqual(fx.shape, (5, 6, 7))
+        self.assertEqual(fy.shape, (4, 5, 6, 7))
+
+    def test_leaks(self):
+        mx.synchronize()
+        if mx.metal.is_available():
+            mem_pre = mx.get_active_memory()
+        else:
+            mem_pre = 0
+
+        def outer():
+            d = {}
+
+            def f(x):
+                return d["x"]
+
+            d["f"] = mx.vmap(f)
+            d["x"] = mx.array([0] * 1000)
+
+        for _ in range(5):
+            outer()
+            gc.collect()
+
+        if mx.metal.is_available():
+            mem_post = mx.get_active_memory()
+        else:
+            mem_post = 0
+
+        self.assertEqual(mem_pre, mem_post)
+
+    def test_vmap_flatten(self):
+        def fun(x):
+            return mx.flatten(x, 0, 1)
+
+        x = mx.zeros((2, 3, 4))
+
+        self.assertEqual(mx.vmap(fun)(x).shape, (2, 12))
+        self.assertEqual(mx.vmap(fun, in_axes=(1,))(x).shape, (3, 8))
+        self.assertEqual(mx.vmap(fun, in_axes=(2,))(x).shape, (4, 6))
+
+    def test_vmap_conv(self):
+        # vmap input only
+        x = mx.random.uniform(shape=(2, 2, 5, 4))
+        w = mx.random.uniform(shape=(8, 3, 4))
+
+        expected = mx.stack([mx.conv1d(xi, w) for xi in x])
+        out = mx.vmap(mx.conv1d, in_axes=(0, None))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        x = mx.moveaxis(x, 0, 2)
+        out = mx.vmap(mx.conv1d, in_axes=(2, None))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        # vmap weights only
+        x = mx.random.uniform(shape=(2, 5, 4))
+        w = mx.random.uniform(shape=(3, 8, 3, 4))
+
+        expected = mx.stack([mx.conv1d(x, wi) for wi in w])
+        out = mx.vmap(mx.conv1d, in_axes=(None, 0))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        w = mx.moveaxis(w, 0, 1)
+        out = mx.vmap(mx.conv1d, in_axes=(None, 1))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        # vmap weights and input
+        x = mx.random.uniform(shape=(3, 2, 5, 4))
+        w = mx.random.uniform(shape=(3, 8, 3, 4))
+
+        expected = mx.stack([mx.conv1d(xi, wi) for xi, wi in zip(x, w)])
+        out = mx.vmap(mx.conv1d, in_axes=(0, 0))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        x = mx.random.uniform(shape=(2, 3, 5, 4))
+        w = mx.random.uniform(shape=(8, 3, 4, 3))
+
+        expected = mx.stack([mx.conv1d(x[:, i], w[..., i]) for i in range(3)])
+        out = mx.vmap(mx.conv1d, in_axes=(1, 3))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
+
+        # Test with groups
+        x = mx.random.uniform(shape=(3, 2, 5, 8))
+        w = mx.random.uniform(shape=(3, 2, 3, 4))
+
+        def gconv(x, w):
+            return mx.conv1d(x, w, groups=2)
+
+        expected = mx.stack([gconv(xi, wi) for xi, wi in zip(x, w)])
+        out = mx.vmap(gconv, in_axes=(0, 0))(x, w)
+        self.assertTrue(mx.allclose(expected, out))
 
 
 if __name__ == "__main__":

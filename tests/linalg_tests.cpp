@@ -100,7 +100,7 @@ TEST_CASE("[mlx.core.linalg.norm] double ord") {
       norm(x, -std::numeric_limits<double>::infinity()).item<float>(),
       doctest::Approx(expected));
 
-  x = reshape(arange(9), {3, 3});
+  x = reshape(arange(9, float32), {3, 3});
 
   CHECK(allclose(
             norm(x, 2.0, 0, false),
@@ -129,10 +129,34 @@ TEST_CASE("[mlx.core.linalg.norm] double ord") {
   CHECK_EQ(
       norm(x, -1.0, std::vector<int>{1, 0}).item<float>(),
       doctest::Approx(3.0));
+  CHECK_EQ(
+      norm(x, 2.0, std::vector<int>{0, 1}, false, Device::cpu).item<float>(),
+      doctest::Approx(14.226707));
+  CHECK_EQ(
+      norm(x, 2.0, std::vector<int>{1, 0}, false, Device::cpu).item<float>(),
+      doctest::Approx(14.226707));
+  CHECK_EQ(
+      norm(x, -2.0, std::vector<int>{0, 1}, false, Device::cpu).item<float>(),
+      doctest::Approx(0.0));
+  CHECK_EQ(
+      norm(x, -2.0, std::vector<int>{1, 0}, false, Device::cpu).item<float>(),
+      doctest::Approx(0.0));
   CHECK_EQ(norm(x, 1.0, std::vector<int>{0, 1}, true).shape(), Shape{1, 1});
   CHECK_EQ(norm(x, 1.0, std::vector<int>{1, 0}, true).shape(), Shape{1, 1});
   CHECK_EQ(norm(x, -1.0, std::vector<int>{0, 1}, true).shape(), Shape{1, 1});
   CHECK_EQ(norm(x, -1.0, std::vector<int>{1, 0}, true).shape(), Shape{1, 1});
+  CHECK_EQ(
+      norm(x, 2.0, std::vector<int>{0, 1}, true, Device::cpu).shape(),
+      Shape{1, 1});
+  CHECK_EQ(
+      norm(x, 2.0, std::vector<int>{1, 0}, true, Device::cpu).shape(),
+      Shape{1, 1});
+  CHECK_EQ(
+      norm(x, -2.0, std::vector<int>{0, 1}, true, Device::cpu).shape(),
+      Shape{1, 1});
+  CHECK_EQ(
+      norm(x, -2.0, std::vector<int>{1, 0}, true, Device::cpu).shape(),
+      Shape{1, 1});
 
   CHECK_EQ(
       norm(x, -1.0, std::vector<int>{-2, -1}, false).item<float>(),
@@ -140,8 +164,14 @@ TEST_CASE("[mlx.core.linalg.norm] double ord") {
   CHECK_EQ(
       norm(x, 1.0, std::vector<int>{-2, -1}, false).item<float>(),
       doctest::Approx(15.0));
+  CHECK_EQ(
+      norm(x, -2.0, std::vector<int>{-2, -1}, false, Device::cpu).item<float>(),
+      doctest::Approx(0.0));
+  CHECK_EQ(
+      norm(x, 2.0, std::vector<int>{-2, -1}, false, Device::cpu).item<float>(),
+      doctest::Approx(14.226707));
 
-  x = reshape(arange(18), {2, 3, 3});
+  x = reshape(arange(18, float32), {2, 3, 3});
   CHECK_THROWS(norm(x, 2.0, std::vector{0, 1, 2}));
   CHECK(allclose(
             norm(x, 3.0, 0),
@@ -199,13 +229,31 @@ TEST_CASE("[mlx.core.linalg.norm] double ord") {
             .item<bool>());
   CHECK(allclose(norm(x, -1.0, std::vector<int>{1, 2}), array({9, 36}))
             .item<bool>());
+  CHECK(allclose(
+            norm(x, 2.0, std::vector<int>{0, 1}, false, Device::cpu),
+            array({22.045408, 24.155825, 26.318918}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, 2.0, std::vector<int>{1, 2}, false, Device::cpu),
+            array({14.226707, 39.759212}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, -2.0, std::vector<int>{0, 1}, false, Device::cpu),
+            array({3, 2.7378995, 2.5128777}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, -2.0, std::vector<int>{1, 2}, false, Device::cpu),
+            array({4.979028e-16, 7.009628e-16}),
+            /* rtol = */ 1e-5,
+            /* atol = */ 1e-6)
+            .item<bool>());
 }
 
 TEST_CASE("[mlx.core.linalg.norm] string ord") {
   array x({1, 2, 3});
   CHECK_THROWS(norm(x, "fro"));
 
-  x = reshape(arange(9), {3, 3});
+  x = reshape(arange(9, float32), {3, 3});
   CHECK_THROWS(norm(x, "bad ord"));
 
   CHECK_EQ(
@@ -214,8 +262,11 @@ TEST_CASE("[mlx.core.linalg.norm] string ord") {
   CHECK_EQ(
       norm(x, "fro", std::vector<int>{0, 1}).item<float>(),
       doctest::Approx(14.2828568570857));
+  CHECK_EQ(
+      norm(x, "nuc", std::vector<int>{0, 1}, false, Device::cpu).item<float>(),
+      doctest::Approx(15.491934));
 
-  x = reshape(arange(18), {2, 3, 3});
+  x = reshape(arange(18, float32), {2, 3, 3});
   CHECK(allclose(
             norm(x, "fro", std::vector<int>{0, 1}),
             array({22.24859546, 24.31049156, 26.43860813}))
@@ -239,6 +290,18 @@ TEST_CASE("[mlx.core.linalg.norm] string ord") {
   CHECK(allclose(
             norm(x, "f", std::vector<int>{2, 1}),
             array({14.28285686, 39.7617907}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, "nuc", std::vector<int>{0, 1}, false, Device::cpu),
+            array({25.045408, 26.893724, 28.831797}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, "nuc", std::vector<int>{1, 2}, false, Device::cpu),
+            array({15.491934, 40.211937}))
+            .item<bool>());
+  CHECK(allclose(
+            norm(x, "nuc", std::vector<int>{-2, -1}, false, Device::cpu),
+            array({15.491934, 40.211937}))
             .item<bool>());
 }
 
@@ -271,7 +334,7 @@ TEST_CASE("test SVD factorization") {
 
   const auto prng_key = random::key(42);
   const auto A = mlx::core::random::normal({5, 4}, prng_key);
-  const auto outs = linalg::svd(A, Device::cpu);
+  const auto outs = linalg::svd(A, true, Device::cpu);
   CHECK_EQ(outs.size(), 3);
 
   const auto& U = outs[0];
@@ -291,6 +354,15 @@ TEST_CASE("test SVD factorization") {
   CHECK_EQ(U.dtype(), float32);
   CHECK_EQ(S.dtype(), float32);
   CHECK_EQ(Vt.dtype(), float32);
+
+  // Test singular values
+  const auto& outs_sv = linalg::svd(A, false, Device::cpu);
+  const auto SV = outs_sv[0];
+
+  CHECK_EQ(SV.shape(), Shape{4});
+  CHECK_EQ(SV.dtype(), float32);
+
+  CHECK(allclose(norm(SV), norm(A, "fro")).item<bool>());
 }
 
 TEST_CASE("test matrix inversion") {
@@ -464,4 +536,96 @@ TEST_CASE("test matrix eigh") {
 
   // Verify eigendecomposition
   CHECK(allclose(matmul(A, eigvecs), eigvals * eigvecs).item<bool>());
+}
+
+TEST_CASE("test lu") {
+  // Test 2x2 matrix
+  array a = array({1., 2., 3., 4.}, {2, 2});
+  auto out = linalg::lu(a, Device::cpu);
+  auto L = take_along_axis(out[1], expand_dims(out[0], -1), -2);
+  array expected = matmul(L, out[2]);
+  CHECK(allclose(a, expected).item<bool>());
+
+  // Test 3x3 matrix
+  a = array({1., 2., 3., 4., 5., 6., 7., 8., 10.}, {3, 3});
+  out = linalg::lu(a, Device::cpu);
+  L = take_along_axis(out[1], expand_dims(out[0], -1), -2);
+  expected = matmul(L, out[2]);
+  CHECK(allclose(a, expected).item<bool>());
+
+  // Test batch dimension
+  a = broadcast_to(a, {3, 3, 3});
+  out = linalg::lu(a, Device::cpu);
+  L = take_along_axis(out[1], expand_dims(out[0], -1), -2);
+  expected = matmul(L, out[2]);
+  CHECK(allclose(a, expected).item<bool>());
+}
+
+TEST_CASE("test solve") {
+  // 0D and 1D throw
+  CHECK_THROWS(linalg::solve(array(0.), array(0.), Device::cpu));
+  CHECK_THROWS(linalg::solve(array({0.}), array({0.}), Device::cpu));
+
+  // Unsupported types throw
+  CHECK_THROWS(
+      linalg::solve(array({0, 1, 1, 2}, {2, 2}), array({1, 3}), Device::cpu));
+
+  // Non-square throws
+  array a = reshape(arange(6), {3, 2});
+  array b = reshape(arange(3), {3, 1});
+  CHECK_THROWS(linalg::solve(a, b, Device::cpu));
+
+  // Test 2x2 matrix with 1D rhs
+  a = array({2., 1., 1., 3.}, {2, 2});
+  b = array({8., 13.}, {2});
+
+  array result = linalg::solve(a, b, Device::cpu);
+  CHECK(allclose(matmul(a, result), b).item<bool>());
+
+  // Test 3x3 matrix
+  a = array({1., 2., 3., 4., 5., 6., 7., 8., 10.}, {3, 3});
+  b = array({6., 15., 25.}, {3, 1});
+
+  result = linalg::solve(a, b, Device::cpu);
+  CHECK(allclose(matmul(a, result), b).item<bool>());
+
+  // Test batch dimension
+  a = broadcast_to(a, {5, 3, 3});
+  b = broadcast_to(b, {5, 3, 1});
+
+  result = linalg::solve(a, b, Device::cpu);
+  CHECK(allclose(matmul(a, result), b).item<bool>());
+
+  // Test multi-column rhs
+  a = array({2., 1., 1., 1., 3., 2., 1., 0., 0.}, {3, 3});
+  b = array({4., 2., 5., 3., 6., 1.}, {3, 2});
+
+  result = linalg::solve(a, b, Device::cpu);
+  CHECK(allclose(matmul(a, result), b).item<bool>());
+
+  // Test batch multi-column rhs
+  a = broadcast_to(a, {5, 3, 3});
+  b = broadcast_to(b, {5, 3, 2});
+
+  result = linalg::solve(a, b, Device::cpu);
+  CHECK(allclose(matmul(a, result), b).item<bool>());
+}
+
+TEST_CASE("test solve_triangluar") {
+  // Test lower triangular matrix
+  array a = array({2., 0., 0., 3., 1., 0., 1., -1., 1.}, {3, 3});
+  array b = array({2., 5., 0.});
+
+  array result =
+      linalg::solve_triangular(a, b, /* upper = */ false, Device::cpu);
+  array expected = array({1., 2., 1.});
+  CHECK(allclose(expected, result).item<bool>());
+
+  // Test upper triangular matrix
+  a = array({2., 1., 3., 0., 4., 2., 0., 0., 1.}, {3, 3});
+  b = array({5., 14., 3.});
+
+  result = linalg::solve_triangular(a, b, /* upper = */ true, Device::cpu);
+  expected = array({-3., 2., 3.});
+  CHECK(allclose(expected, result).item<bool>());
 }

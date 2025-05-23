@@ -21,25 +21,23 @@ namespace mlx::core::metal {
 
 // Note, this function must be left inline in a header so that it is not
 // dynamically linked.
-inline std::string get_colocated_mtllib_path(const std::string& lib_name) {
+inline std::string get_binary_directory() {
   Dl_info info;
-  std::string mtllib_path;
-  std::string lib_ext = lib_name + ".metallib";
-
-  int success = dladdr((void*)get_colocated_mtllib_path, &info);
+  std::string directory;
+  int success = dladdr((void*)get_binary_directory, &info);
   if (success) {
-    auto mtllib = fs::path(info.dli_fname).remove_filename() / lib_ext;
-    mtllib_path = mtllib.c_str();
+    directory = fs::path(info.dli_fname).remove_filename().c_str();
   }
-
-  return mtllib_path;
+  return directory;
 }
 
 using MTLFCList =
     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
 
+struct DeviceStream;
+
 struct CommandEncoder {
-  CommandEncoder(MTL::CommandBuffer* cbuf);
+  explicit CommandEncoder(DeviceStream& stream);
   CommandEncoder(const CommandEncoder&) = delete;
   CommandEncoder& operator=(const CommandEncoder&) = delete;
 
@@ -60,7 +58,7 @@ struct CommandEncoder {
 
   void set_input_array(const array& a, int idx, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
-  void register_output_array(array& a);
+  void register_output_array(const array& a);
   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
@@ -97,6 +95,10 @@ struct CommandEncoder {
     return enc_->setBytes(&v, sizeof(T), idx);
   }
 
+  void set_threadgroup_memory_length(size_t length, int idx) {
+    enc_->setThreadgroupMemoryLength(length, idx);
+  }
+
   ConcurrentContext start_concurrent() {
     return ConcurrentContext(*this);
   }
@@ -115,6 +117,7 @@ struct CommandEncoder {
   void barrier();
 
  private:
+  DeviceStream& stream_;
   MTL::ComputeCommandEncoder* enc_;
   bool needs_barrier_{false};
   bool concurrent_{false};
@@ -147,10 +150,10 @@ struct DeviceStream {
   // Used to allow thread-safe access to the outputs map
   std::mutex fence_mtx;
 
-  // The buffer and buffer op count are updated
-  // between command buffers
+  // Data updated between command buffers
   MTL::CommandBuffer* buffer{nullptr};
   int buffer_ops{0};
+  size_t buffer_sizes{0};
 
   // The command encoder, fence, and temporaries are updated between command
   // encoders
@@ -175,24 +178,18 @@ class Device {
   }
 
   void new_queue(int index);
+
+  MTL::CommandQueue* get_queue(Stream stream);
+
   MTL::CommandBuffer* get_command_buffer(int index);
-  int get_command_buffer_ops(int index);
-  void increment_command_buffer_ops(int index);
+  bool command_buffer_needs_commit(int index);
   void commit_command_buffer(int index);
   CommandEncoder& get_command_encoder(int index);
   void end_encoding(int index);
 
   void register_library(
       const std::string& lib_name,
-      const std::string& lib_path);
-
-  // Note, this should remain in the header so that it is not dynamically
-  // linked
-  void register_library(const std::string& lib_name) {
-    if (auto it = library_map_.find(lib_name); it == library_map_.end()) {
-      register_library(lib_name, get_colocated_mtllib_path(lib_name));
-    }
-  }
+      const std::string& lib_path = "");
 
   MTL::Library* get_library(
       const std::string& name,
@@ -267,8 +264,12 @@ class Device {
   std::unordered_map<std::string, MTL::Library*> library_map_;
   const MTL::ResidencySet* residency_set_{nullptr};
   std::string arch_;
+  int max_ops_per_buffer_;
+  int max_mb_per_buffer_;
 };
 
 Device& device(mlx::core::Device);
+
+std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool();
 
 } // namespace mlx::core::metal

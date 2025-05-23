@@ -58,14 +58,14 @@ void binary_op_dispatch_dims(
     Op op) {
   auto [shape, strides] = collapse_contiguous_dims(
       a.shape(), {a.strides(), b.strides(), out_a.strides()});
-  const auto& a_strides = strides[0];
-  const auto& b_strides = strides[1];
-  const auto& out_strides = strides[2];
   const T* a_ptr = a.data<T>();
   const T* b_ptr = b.data<T>();
   U* out_a_ptr = out_a.data<U>();
   U* out_b_ptr = out_b.data<U>();
 
+  const auto& a_strides = strides[0];
+  const auto& b_strides = strides[1];
+  const auto& out_strides = strides[2];
   int ndim = shape.size();
   switch (ndim) {
     case 1:
@@ -120,14 +120,10 @@ template <typename T, typename U = T, typename Op>
 void binary_op(
     const array& a,
     const array& b,
-    std::vector<array>& outputs,
-    Op op) {
-  auto bopt = get_binary_op_type(a, b);
-  auto& out_a = outputs[0];
-  auto& out_b = outputs[1];
-  set_binary_op_output_data(a, b, out_a, bopt);
-  set_binary_op_output_data(a, b, out_b, bopt);
-
+    array& out_a,
+    array& out_b,
+    Op op,
+    BinaryOpType bopt) {
   // The full computation is scalar scalar so call the base op once
   if (bopt == BinaryOpType::General) {
     binary_op_dispatch_dims<T, U, Op>(a, b, out_a, out_b, op);
@@ -141,14 +137,14 @@ void binary_op(
   if (bopt == BinaryOpType::ScalarScalar) {
     std::tie(*out_a_ptr, *out_b_ptr) = op(*a_ptr, *b_ptr);
   } else if (bopt == BinaryOpType::ScalarVector) {
-    for (size_t i = 0; i < b.size(); ++i) {
+    for (size_t i = 0; i < b.data_size(); ++i) {
       std::tie(*out_a_ptr, *out_b_ptr) = op(*a_ptr, *b_ptr);
       out_a_ptr++;
       out_b_ptr++;
       b_ptr++;
     }
   } else if (bopt == BinaryOpType::VectorScalar) {
-    for (size_t i = 0; i < a.size(); ++i) {
+    for (size_t i = 0; i < a.data_size(); ++i) {
       std::tie(*out_a_ptr, *out_b_ptr) = op(*a_ptr, *b_ptr);
       out_a_ptr++;
       out_b_ptr++;
@@ -162,55 +158,6 @@ void binary_op(
       a_ptr++;
       b_ptr++;
     }
-  }
-}
-
-template <typename Op>
-void binary(
-    const array& a,
-    const array& b,
-    std::vector<array>& outputs,
-    Op op) {
-  switch (outputs[0].dtype()) {
-    case bool_:
-      binary_op<bool>(a, b, outputs, op);
-      break;
-    case uint8:
-      binary_op<uint8_t>(a, b, outputs, op);
-      break;
-    case uint16:
-      binary_op<uint16_t>(a, b, outputs, op);
-      break;
-    case uint32:
-      binary_op<uint32_t>(a, b, outputs, op);
-      break;
-    case uint64:
-      binary_op<uint64_t>(a, b, outputs, op);
-      break;
-    case int8:
-      binary_op<int8_t>(a, b, outputs, op);
-      break;
-    case int16:
-      binary_op<int16_t>(a, b, outputs, op);
-      break;
-    case int32:
-      binary_op<int32_t>(a, b, outputs, op);
-      break;
-    case int64:
-      binary_op<int64_t>(a, b, outputs, op);
-      break;
-    case float16:
-      binary_op<float16_t>(a, b, outputs, op);
-      break;
-    case float32:
-      binary_op<float>(a, b, outputs, op);
-      break;
-    case bfloat16:
-      binary_op<bfloat16_t>(a, b, outputs, op);
-      break;
-    case complex64:
-      binary_op<complex64_t>(a, b, outputs, op);
-      break;
   }
 }
 

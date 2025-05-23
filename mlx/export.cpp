@@ -1,12 +1,11 @@
 // Copyright © 2024 Apple Inc.
 #include "mlx/export.h"
+#include <map>
 #include "mlx/compile_impl.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
-
-#define STRINGIFY(x) #x
-#define TOSTRING(x) STRINGIFY(x)
+#include "mlx/version.h"
 
 // clang-format off
 #define SERIALIZE_PRIMITIVE(primitive, ...)  \
@@ -280,6 +279,7 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(LogicalAnd),
       SERIALIZE_PRIMITIVE(LogicalOr),
       SERIALIZE_PRIMITIVE(LogAddExp),
+      SERIALIZE_PRIMITIVE(LogSumExp),
       SERIALIZE_PRIMITIVE(Matmul),
       SERIALIZE_PRIMITIVE(Maximum),
       SERIALIZE_PRIMITIVE(Minimum),
@@ -299,7 +299,13 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(Reshape),
       SERIALIZE_PRIMITIVE(Reduce, "And", "Or", "Sum", "Prod", "Min", "Max"),
       SERIALIZE_PRIMITIVE(Round),
-      SERIALIZE_PRIMITIVE(Scan, "CumSum", "CumProd", "CumMin", "CumMax"),
+      SERIALIZE_PRIMITIVE(
+          Scan,
+          "CumSum",
+          "CumProd",
+          "CumMin",
+          "CumMax",
+          "CumLogaddexp"),
       SERIALIZE_PRIMITIVE(Scatter),
       SERIALIZE_PRIMITIVE(Select),
       SERIALIZE_PRIMITIVE(Sigmoid),
@@ -325,6 +331,7 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(SVD),
       SERIALIZE_PRIMITIVE(Inverse),
       SERIALIZE_PRIMITIVE(Cholesky),
+      SERIALIZE_PRIMITIVE(Eig),
       SERIALIZE_PRIMITIVE(Eigh),
       SERIALIZE_PRIMITIVE(AffineQuantize),
       SERIALIZE_PRIMITIVE(RMSNorm),
@@ -379,7 +386,7 @@ struct PrimitiveFactory {
 };
 
 void write_header(Writer& os, int count, bool shapeless) {
-  serialize(os, std::string(TOSTRING(MLX_VERSION)));
+  serialize(os, std::string(version()));
   serialize(os, count);
   serialize(os, shapeless);
 }
@@ -464,6 +471,9 @@ bool FunctionTable::match(
     if (x.dtype() != y.dtype()) {
       return false;
     }
+    if (x.ndim() != y.ndim()) {
+      return false;
+    }
     if (!shapeless && x.shape() != y.shape()) {
       return false;
     }
@@ -476,7 +486,9 @@ bool FunctionTable::match(
       return false;
     }
   }
-  for (auto& [_, in] : kwargs) {
+  auto sorted_kwargs =
+      std::map<std::string, array>(kwargs.begin(), kwargs.end());
+  for (auto& [_, in] : sorted_kwargs) {
     if (!match_inputs(in, fun.inputs[i++])) {
       return false;
     }
@@ -552,7 +564,9 @@ void FunctionExporter::export_function(const Args& args, const Kwargs& kwargs) {
   // Flatten the inputs to the function for tracing
   std::vector<std::string> kwarg_keys;
   auto inputs = args;
-  for (auto& [k, v] : kwargs) {
+  auto sorted_kwargs =
+      std::map<std::string, array>(kwargs.begin(), kwargs.end());
+  for (auto& [k, v] : sorted_kwargs) {
     kwarg_keys.push_back(k);
     inputs.push_back(v);
   }
@@ -834,7 +848,7 @@ ImportedFunction::ImportedFunction(const std::string& file)
                 std::move(shape),
                 type,
                 std::make_shared<Load>(
-                    default_stream(default_device()), is_ptr, offset),
+                    default_stream(Device::cpu), is_ptr, offset),
                 {}));
             is.seek(offset + tape.back().nbytes());
             constants.insert({id, tape.back()});

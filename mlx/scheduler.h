@@ -8,8 +8,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include "mlx/backend/metal/metal.h"
-#include "mlx/backend/metal/metal_impl.h"
+#include "mlx/backend/gpu/eval.h"
 #include "mlx/device.h"
 #include "mlx/stream.h"
 
@@ -20,16 +19,11 @@ struct StreamThread {
   std::queue<std::function<void()>> q;
   std::condition_variable cond;
   bool stop;
-  Stream stream;
   std::thread thread;
 
-  StreamThread(Stream stream)
-      : stop(false), stream(stream), thread(&StreamThread::thread_fn, this) {
-    metal::new_stream(stream);
-  }
+  StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
 
   ~StreamThread() {
-    synchronize(stream);
     {
       std::lock_guard<std::mutex> lk(mtx);
       stop = true;
@@ -72,7 +66,7 @@ struct StreamThread {
 class Scheduler {
  public:
   Scheduler() : n_active_tasks_(0) {
-    if (metal::is_available()) {
+    if (is_available(Device::gpu)) {
       default_streams_.insert({Device::gpu, new_stream(Device::gpu)});
     }
     default_streams_.insert({Device::cpu, new_stream(Device::cpu)});
@@ -85,9 +79,14 @@ class Scheduler {
   Scheduler& operator=(Scheduler&&) = delete;
 
   Stream new_stream(const Device& d) {
-    auto stream = Stream(streams_.size(), d);
-    streams_.push_back(new StreamThread{stream});
-    return stream;
+    streams_.emplace_back(streams_.size(), d);
+    if (d == Device::gpu) {
+      threads_.push_back(nullptr);
+      gpu::new_stream(streams_.back());
+    } else {
+      threads_.push_back(new StreamThread{});
+    }
+    return streams_.back();
   }
 
   template <typename F>
@@ -97,7 +96,7 @@ class Scheduler {
     return default_streams_.at(d.type);
   }
   Stream get_stream(int index) const {
-    return streams_.at(index)->stream;
+    return streams_.at(index);
   }
 
   void set_default_stream(const Stream& s) {
@@ -129,20 +128,26 @@ class Scheduler {
     int n_tasks_old = n_active_tasks();
     if (n_tasks_old > 1) {
       completion_cv.wait(lk, [this, n_tasks_old] {
-        return this->n_active_tasks() != n_tasks_old;
+        return this->n_active_tasks() < n_tasks_old;
       });
     }
   }
 
   ~Scheduler() {
     for (auto s : streams_) {
-      delete s;
+      synchronize(s);
+    }
+    for (auto t : threads_) {
+      if (t != nullptr) {
+        delete t;
+      }
     }
   }
 
  private:
   int n_active_tasks_;
-  std::vector<StreamThread*> streams_;
+  std::vector<StreamThread*> threads_;
+  std::vector<Stream> streams_;
   std::unordered_map<Device::DeviceType, Stream> default_streams_;
   std::condition_variable completion_cv;
   std::mutex mtx;
@@ -150,7 +155,7 @@ class Scheduler {
 
 template <typename F>
 void Scheduler::enqueue(const Stream& stream, F&& f) {
-  streams_[stream.index]->enqueue(std::forward<F>(f));
+  threads_[stream.index]->enqueue(std::forward<F>(f));
 }
 
 Scheduler& scheduler();

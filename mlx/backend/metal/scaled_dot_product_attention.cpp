@@ -1,9 +1,8 @@
 // Copyright © 2024 Apple Inc.
-
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
-#include "mlx/backend/metal/copy.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
@@ -21,7 +20,9 @@ void sdpa_full_self_attention_metal(
     const array& k,
     const array& v,
     const float scale,
-    array& o) {
+    array& o,
+    bool do_causal_ = false,
+    const std::optional<array>& mask = std::nullopt) {
   using namespace mlx::steel;
 
   int wm = 4;
@@ -41,11 +42,14 @@ void sdpa_full_self_attention_metal(
 
   const bool align_Q = (qL % bq) == 0;
   const bool align_K = (kL % bk) == 0;
+  const bool has_mask = !!mask;
+  const bool do_causal = do_causal_;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
-  };
+      {&has_mask, MTL::DataType::DataTypeBool, 300},
+      {&do_causal, MTL::DataType::DataTypeBool, 301}};
 
   std::ostringstream kname;
   // clang-format off
@@ -54,13 +58,17 @@ void sdpa_full_self_attention_metal(
         << "_bq" << bq
         << "_bk" << bk
         << "_bd" << bd
-        << "_wm" << wm << "_wn" << wn; // clang-format on
+        << "_wm" << wm
+        << "_wn" << wn
+        << "_mask" << (type_to_name(has_mask ? *mask : q)); // clang-format on
 
   std::string base_name = kname.str();
 
   // clang-format off
   kname << "_align_Q_" << (align_Q ? 't' : 'n')
-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+        << "_align_K_" << (align_K ? 't' : 'n')
+        << "_has_mask_" << (has_mask ? 't' : 'n')
+        << "_do_causal_" << (do_causal ? 't' : 'n'); // clang-format on
 
   std::string hash_name = kname.str();
 
@@ -91,6 +99,10 @@ void sdpa_full_self_attention_metal(
       /* int NQ_aligned = */ NQ_aligned,
       /* int NK_aligned = */ NK_aligned,
 
+      /* int qL_rem = */ (qL - NQ_aligned * bq),
+      /* int kL_rem = */ (kL - NK_aligned * bk),
+      /* int qL_off = */ (kL - qL),
+
       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
@@ -101,6 +113,16 @@ void sdpa_full_self_attention_metal(
   compute_encoder.set_input_array(v, 2);
   compute_encoder.set_output_array(o, 3);
   compute_encoder.set_bytes(params, 4);
+
+  if (mask) {
+    auto m = *mask;
+
+    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {
+        m.strides(0), m.strides(1), m.strides(2)}};
+
+    compute_encoder.set_bytes(mask_params, 5);
+    compute_encoder.set_input_array(m, 6);
+  }
 
   MTL::Size grid_dims = MTL::Size(NQ, H, B);
   MTL::Size group_dims = MTL::Size(32, wm, wn);
@@ -116,6 +138,7 @@ void sdpa_vector(
     const array& v,
     array& out,
     float scale,
+    bool do_causal,
     const std::optional<array>& mask) {
   // Set the kernel name
   std::string kname;
@@ -131,17 +154,29 @@ void sdpa_vector(
   int gqa_factor = q.shape(1) / k.shape(1);
   int N = k.shape(2);
   int B = q.shape(0) * q.shape(1);
-  size_t k_stride = k.strides()[1];
-  size_t v_stride = v.strides()[1];
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+
   MTL::Size group_dims(1024, 1, 1);
-  MTL::Size grid_dims(1, B, 1);
+  MTL::Size grid_dims(B, q.shape(2), 1);
 
   bool has_mask = mask.has_value();
+  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+  bool float_mask = has_mask && !bool_mask;
+  bool query_transposed = !q.flags().row_contiguous;
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
   };
   std::string hash_name = kname;
-  hash_name += has_mask ? "_mask" : "_nomask";
+  hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += do_causal ? "_c" : "_nc";
 
   // Get the kernel
   auto& compute_encoder = d.get_command_encoder(s.index);
@@ -149,22 +184,28 @@ void sdpa_vector(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
-  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
+  compute_encoder.set_input_array(q, 0);
   compute_encoder.set_input_array(k, 1);
   compute_encoder.set_input_array(v, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(gqa_factor, 4);
   compute_encoder.set_bytes(N, 5);
-  compute_encoder.set_bytes(k_stride, 6);
-  compute_encoder.set_bytes(v_stride, 7);
-  compute_encoder.set_bytes(scale, 8);
+  compute_encoder.set_bytes(k_head_stride, 6);
+  compute_encoder.set_bytes(k_seq_stride, 7);
+  compute_encoder.set_bytes(v_head_stride, 8);
+  compute_encoder.set_bytes(v_seq_stride, 9);
+
+  compute_encoder.set_bytes(scale, 10);
   if (has_mask) {
     auto& m = *mask;
-    compute_encoder.set_input_array(m, 9);
-    int32_t seq_stride = m.ndim() >= 1 ? m.strides().back() : 0;
-    int32_t head_stride = m.ndim() >= 3 ? *(m.strides().end() - 3) : 0;
-    compute_encoder.set_bytes(seq_stride, 10);
-    compute_encoder.set_bytes(head_stride, 11);
+    compute_encoder.set_input_array(m, 11 + float_mask);
+    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+    int32_t head_stride =
+        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+    compute_encoder.set_bytes(kv_seq_stride, 13);
+    compute_encoder.set_bytes(q_seq_stride, 14);
+    compute_encoder.set_bytes(head_stride, 15);
   }
 
   // Launch
@@ -179,6 +220,7 @@ void sdpa_vector_2pass(
     const array& v,
     array& out,
     float scale,
+    bool do_causal,
     const std::optional<array>& mask) {
   // Set the kernel name
   std::string kname;
@@ -195,10 +237,13 @@ void sdpa_vector_2pass(
   int N = k.shape(2);
   int blocks = 32;
   int B = q.shape(0) * q.shape(1);
-  auto k_stride = k.strides()[1];
-  auto v_stride = v.strides()[1];
+
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
   MTL::Size group_dims(8 * 32, 1, 1);
-  MTL::Size grid_dims(1, B, blocks);
+  MTL::Size grid_dims(B, q.shape(2), blocks);
 
   // Allocate the intermediates
   Shape intermediate_shape;
@@ -211,19 +256,28 @@ void sdpa_vector_2pass(
   intermediate_shape.pop_back();
   array sums(intermediate_shape, float32, nullptr, {});
   array maxs(std::move(intermediate_shape), float32, nullptr, {});
-  intermediate.set_data(allocator::malloc_or_wait(intermediate.nbytes()));
-  sums.set_data(allocator::malloc_or_wait(sums.nbytes()));
-  maxs.set_data(allocator::malloc_or_wait(maxs.nbytes()));
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
   d.add_temporary(intermediate, s.index);
   d.add_temporary(sums, s.index);
   d.add_temporary(maxs, s.index);
 
   bool has_mask = mask.has_value();
+  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+  bool float_mask = has_mask && !bool_mask;
+  bool query_transposed = !q.flags().row_contiguous;
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
   };
   std::string hash_name = kname;
-  hash_name += has_mask ? "_mask" : "_nomask";
+  hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += do_causal ? "_c" : "_nc";
 
   // Get the kernel
   auto& compute_encoder = d.get_command_encoder(s.index);
@@ -232,7 +286,7 @@ void sdpa_vector_2pass(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
-  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
+  compute_encoder.set_input_array(q, 0);
   compute_encoder.set_input_array(k, 1);
   compute_encoder.set_input_array(v, 2);
   compute_encoder.set_output_array(intermediate, 3);
@@ -240,16 +294,21 @@ void sdpa_vector_2pass(
   compute_encoder.set_output_array(maxs, 5);
   compute_encoder.set_bytes(gqa_factor, 6);
   compute_encoder.set_bytes(N, 7);
-  compute_encoder.set_bytes(k_stride, 8);
-  compute_encoder.set_bytes(v_stride, 9);
-  compute_encoder.set_bytes(scale, 10);
+  compute_encoder.set_bytes(k_head_stride, 8);
+  compute_encoder.set_bytes(k_seq_stride, 9);
+  compute_encoder.set_bytes(v_head_stride, 10);
+  compute_encoder.set_bytes(v_seq_stride, 11);
+  compute_encoder.set_bytes(scale, 12);
   if (has_mask) {
     auto& m = *mask;
-    compute_encoder.set_input_array(m, 11);
-    int32_t seq_stride = m.ndim() >= 1 ? m.strides().back() : 0;
-    int32_t head_stride = m.ndim() >= 3 ? *(m.strides().end() - 3) : 0;
-    compute_encoder.set_bytes(seq_stride, 12);
-    compute_encoder.set_bytes(head_stride, 13);
+    compute_encoder.set_input_array(m, 13 + float_mask);
+    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+    int32_t head_stride =
+        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+    compute_encoder.set_bytes(kv_seq_stride, 15);
+    compute_encoder.set_bytes(q_seq_stride, 16);
+    compute_encoder.set_bytes(head_stride, 17);
   }
 
   // Launch
@@ -274,7 +333,7 @@ void sdpa_vector_2pass(
 
   // Launch
   group_dims = MTL::Size(1024, 1, 1);
-  grid_dims = MTL::Size(1, B, 1);
+  grid_dims = MTL::Size(B, q.shape(2), 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -301,59 +360,83 @@ void ScaledDotProductAttention::eval_gpu(
     if (!predicate(arr)) {
       array arr_copy(arr.shape(), arr.dtype(), nullptr, {});
       copy_gpu(arr, arr_copy, CopyType::General, s);
-      copies.push_back(arr_copy);
+      copies.push_back(std::move(arr_copy));
       return copies.back();
     } else {
       return arr;
     }
   };
 
-  // Checks if arr is fully row contiguous
-  auto is_contiguous = [](const array& arr) {
-    return arr.flags().row_contiguous;
-  };
-
-  // Returns true if the array is row contiguous except the sequence length
-  // dimension that can be sliced but with step=1.
-  auto is_contiguous_except_seq_len = [](const array& arr) {
-    auto& strides = arr.strides();
-    auto& shape = arr.shape();
-    return strides[3] == 1 && strides[2] == shape[3] &&
-        strides[0] == strides[1] * shape[1];
-  };
-
   // Checks that the headdim dimension has stride 1.
   auto is_matrix_contiguous = [](const array& arr) {
-    return arr.strides(3) == 1;
+    return arr.strides(-1) == 1;
   };
 
   // We are in vector mode ie single query
-  if (q_pre.shape(2) == 1) {
-    const auto& q = copy_unless(is_contiguous, q_pre);
-    // 1, heads, seq_len, head_dim
-    // mask [1, query_heads, 1, seq_len]
-    const auto& k = copy_unless(is_contiguous_except_seq_len, k_pre);
-    const auto& v = copy_unless(is_contiguous_except_seq_len, v_pre);
+  if (q_pre.shape(2) <= 8) {
+    auto q_copy_unless = [](const array& arr) {
+      if (arr.flags().row_contiguous) {
+        return true;
+      }
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      if (shape[0] == 1 || shape[1] == 1) {
+        // If either the batch or head dimension is a singleton, the other can
+        // be transposed with the sequence dimension
+        auto bidx = shape[0] == 1 ? 1 : 0;
+        return (strides[3] == 1) && (strides[2] == shape[3] * shape[bidx]) &&
+            (strides[bidx] == shape[3]);
+      }
+      return false;
+    };
+
+    auto kv_copy_unless = [](const array& arr) {
+      // keys and values should be copied if:
+      // - the last dimension is not contiguous
+      // - the batch and head dim are not contiguous
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      if (strides.back() != 1) {
+        return false;
+      }
+      if (shape[0] == 1 || shape[1] == 1) {
+        return true;
+      }
+      return (strides[0] == strides[1] * shape[1]);
+    };
+
+    const auto& q = copy_unless(q_copy_unless, q_pre);
+    const auto& k = copy_unless(kv_copy_unless, k_pre);
+    const auto& v = copy_unless(kv_copy_unless, v_pre);
 
     // Donate the query if possible
-    if (q.is_donatable() && q.size() == o.size()) {
-      o.move_shared_buffer(q);
+    if (q.is_donatable() && q.flags().row_contiguous && q.size() == o.size()) {
+      o.copy_shared_buffer(q);
     } else {
-      o.set_data(allocator::malloc_or_wait(o.nbytes()));
+      o.set_data(allocator::malloc(o.nbytes()));
     }
 
-    auto mask =
-        inputs.size() > 3 ? std::optional<array>{inputs[3]} : std::nullopt;
+    auto mask_copy_unless = [&q](const array& arr) {
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      return arr.flags().row_contiguous || q.shape(0) == 1 || q.shape(1) == 1 ||
+          (strides[0] == strides[1] * shape[1]);
+    };
+
+    auto mask = inputs.size() > 3
+        ? std::optional<array>{copy_unless(mask_copy_unless, inputs[3])}
+        : std::nullopt;
 
     // We route to the 2 pass fused attention if
     // - The device is large and the sequence length long
     // - The sequence length is even longer and we have gqa
+    bool do_causal = do_causal_ && q.shape(2) > 1;
     char devc = d.get_architecture().back();
     if ((devc == 'd' && k.shape(2) >= 1024) ||
         (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
-      sdpa_vector_2pass(s, d, q, k, v, o, scale_, mask);
+      sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask);
     } else {
-      sdpa_vector(s, d, q, k, v, o, scale_, mask);
+      sdpa_vector(s, d, q, k, v, o, scale_, do_causal, mask);
     }
   }
 
@@ -376,12 +459,16 @@ void ScaledDotProductAttention::eval_gpu(
     };
 
     o.set_data(
-        allocator::malloc_or_wait(o.nbytes()),
+        allocator::malloc(o.nbytes()),
         data_size,
         {str_oB, str_oH, str_oL, str_oD},
         flags);
 
-    sdpa_full_self_attention_metal(s, d, q, k, v, scale_, o);
+    auto mask = inputs.size() > 3
+        ? std::optional<array>{copy_unless(is_matrix_contiguous, inputs[3])}
+        : std::nullopt;
+
+    sdpa_full_self_attention_metal(s, d, q, k, v, scale_, o, do_causal_, mask);
   }
 
   d.add_temporaries(std::move(copies), s.index);

@@ -28,11 +28,45 @@ array all_sum(
   if (group.size() == 1) {
     return x;
   }
-
   return array(
       x.shape(),
       x.dtype(),
-      std::make_shared<AllReduce>(to_stream(s), group, AllReduce::Sum),
+      std::make_shared<AllReduce>(
+          to_stream(s, Device::cpu), group, AllReduce::Sum),
+      {x});
+}
+
+array all_max(
+    const array& x,
+    std::optional<Group> group_ /* = std::nullopt */,
+    StreamOrDevice s /* = {} */) {
+  auto group = to_group(group_);
+
+  if (group.size() == 1) {
+    return x;
+  }
+  return array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<AllReduce>(
+          to_stream(s, Device::cpu), group, AllReduce::Max),
+      {x});
+}
+
+array all_min(
+    const array& x,
+    std::optional<Group> group_ /* = std::nullopt */,
+    StreamOrDevice s /* = {} */) {
+  auto group = to_group(group_);
+
+  if (group.size() == 1) {
+    return x;
+  }
+  return array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<AllReduce>(
+          to_stream(s, Device::cpu), group, AllReduce::Min),
       {x});
 }
 
@@ -55,7 +89,7 @@ array all_gather(
   return array(
       std::move(result_shape),
       x.dtype(),
-      std::make_shared<AllGather>(to_stream(s), group),
+      std::make_shared<AllGather>(to_stream(s, Device::cpu), group),
       {x});
 }
 
@@ -80,7 +114,7 @@ array send(
   return array(
       x.shape(),
       x.dtype(),
-      std::make_shared<Send>(to_stream(s), group, dst),
+      std::make_shared<Send>(to_stream(s, Device::cpu), group, dst),
       {x});
 }
 
@@ -105,7 +139,7 @@ array recv(
   return array(
       std::move(shape),
       std::move(dtype),
-      std::make_shared<Recv>(to_stream(s), group, src),
+      std::make_shared<Recv>(to_stream(s, Device::cpu), group, src),
       std::vector<array>{});
 }
 

@@ -459,6 +459,19 @@ class BitwiseBinary : public UnaryPrimitive {
   Op op_;
 };
 
+class BitwiseInvert : public UnaryPrimitive {
+ public:
+  explicit BitwiseInvert(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_PRINT(BitwiseInvert)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
+};
+
 class BlockMaskedMM : public UnaryPrimitive {
  public:
   explicit BlockMaskedMM(Stream stream, int block_size)
@@ -485,7 +498,13 @@ class BlockMaskedMM : public UnaryPrimitive {
 
 class GatherMM : public UnaryPrimitive {
  public:
-  explicit GatherMM(Stream stream) : UnaryPrimitive(stream) {}
+  explicit GatherMM(
+      Stream stream,
+      bool left_sorted = false,
+      bool right_sorted = false)
+      : UnaryPrimitive(stream),
+        left_sorted_(left_sorted),
+        right_sorted_(right_sorted) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -497,7 +516,14 @@ class GatherMM : public UnaryPrimitive {
       const std::vector<array>& outputs) override;
 
   DEFINE_PRINT(GatherMM)
-  DEFINE_DEFAULT_IS_EQUIVALENT()
+  bool is_equivalent(const Primitive& other) const override;
+  auto state() const {
+    return std::make_pair(left_sorted_, right_sorted_);
+  }
+
+ private:
+  bool left_sorted_;
+  bool right_sorted_;
 };
 
 class BroadcastAxes : public UnaryPrimitive {
@@ -663,13 +689,15 @@ class Convolution : public UnaryPrimitive {
   explicit Convolution(
       Stream stream,
       const std::vector<int>& kernel_strides,
-      const std::vector<int>& padding,
+      const std::vector<int>& padding_lo,
+      const std::vector<int>& padding_hi,
       const std::vector<int>& kernel_dilation,
       const std::vector<int>& input_dilation,
       const int groups = 1,
       const bool flip = false)
       : UnaryPrimitive(stream),
-        padding_(padding),
+        padding_lo_(padding_lo),
+        padding_hi_(padding_hi),
         kernel_strides_(kernel_strides),
         kernel_dilation_(kernel_dilation),
         input_dilation_(input_dilation),
@@ -685,11 +713,13 @@ class Convolution : public UnaryPrimitive {
       const std::vector<int>& argnums,
       const std::vector<array>& outputs) override;
 
+  DEFINE_VMAP()
   DEFINE_PRINT(Convolution)
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
     return std::make_tuple(
-        padding_,
+        padding_lo_,
+        padding_hi_,
         kernel_strides_,
         kernel_dilation_,
         input_dilation_,
@@ -698,7 +728,8 @@ class Convolution : public UnaryPrimitive {
   }
 
  private:
-  std::vector<int> padding_;
+  std::vector<int> padding_lo_;
+  std::vector<int> padding_hi_;
   std::vector<int> kernel_strides_;
   std::vector<int> kernel_dilation_;
   std::vector<int> input_dilation_;
@@ -1218,11 +1249,7 @@ class Load : public UnaryPrimitive {
       : UnaryPrimitive(stream),
         reader_(std::move(reader)),
         offset_(offset),
-        swap_endianness_(swap_endianness) {
-    if (stream.device == Device::gpu) {
-      io_stream();
-    }
-  }
+        swap_endianness_(swap_endianness) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1230,10 +1257,6 @@ class Load : public UnaryPrimitive {
   DEFINE_PRINT(Load)
 
  private:
-  Stream& io_stream() {
-    static Stream io_stream = new_stream(Device::cpu);
-    return io_stream;
-  };
   std::shared_ptr<io::Reader> reader_;
   size_t offset_;
   bool swap_endianness_;
@@ -1343,6 +1366,20 @@ class LogAddExp : public UnaryPrimitive {
   DEFINE_PRINT(LogAddExp)
   DEFINE_DEFAULT_IS_EQUIVALENT()
   DEFINE_INPUT_OUTPUT_SHAPE()
+};
+
+class LogSumExp : public UnaryPrimitive {
+ public:
+  explicit LogSumExp(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_PRINT(LogSumExp)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
 };
 
 class Matmul : public UnaryPrimitive {
@@ -1559,11 +1596,19 @@ class QuantizedMatmul : public UnaryPrimitive {
 
 class GatherQMM : public UnaryPrimitive {
  public:
-  explicit GatherQMM(Stream stream, int group_size, int bits, bool transpose)
+  explicit GatherQMM(
+      Stream stream,
+      int group_size,
+      int bits,
+      bool transpose,
+      bool left_sorted = false,
+      bool right_sorted = false)
       : UnaryPrimitive(stream),
         group_size_(group_size),
         bits_(bits),
-        transpose_(transpose) {}
+        transpose_(transpose),
+        left_sorted_(left_sorted),
+        right_sorted_(right_sorted) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1573,13 +1618,16 @@ class GatherQMM : public UnaryPrimitive {
   DEFINE_PRINT(GatherQMM)
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
-    return std::make_tuple(group_size_, bits_, transpose_);
+    return std::make_tuple(
+        group_size_, bits_, transpose_, left_sorted_, right_sorted_);
   }
 
  private:
   int group_size_;
   int bits_;
   bool transpose_;
+  bool left_sorted_;
+  bool right_sorted_;
 };
 
 class RandomBits : public UnaryPrimitive {
@@ -1709,7 +1757,7 @@ class Round : public UnaryPrimitive {
 
 class Scan : public UnaryPrimitive {
  public:
-  enum ReduceType { Max, Min, Sum, Prod };
+  enum ReduceType { Max, Min, Sum, Prod, LogAddExp };
 
   explicit Scan(
       Stream stream,
@@ -1743,6 +1791,9 @@ class Scan : public UnaryPrimitive {
         break;
       case Max:
         os << "Max";
+        break;
+      case LogAddExp:
+        os << "Logaddexp";
         break;
     }
   }
@@ -1921,7 +1972,6 @@ class Slice : public UnaryPrimitive {
   Shape start_indices_;
   Shape end_indices_;
   Shape strides_;
-  void eval(const std::vector<array>& inputs, array& out);
 };
 
 class SliceUpdate : public UnaryPrimitive {
@@ -2275,7 +2325,8 @@ class QRF : public Primitive {
 /* SVD primitive. */
 class SVD : public Primitive {
  public:
-  explicit SVD(Stream stream) : Primitive(stream) {}
+  explicit SVD(Stream stream, bool compute_uv)
+      : Primitive(stream), compute_uv_(compute_uv) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -2284,6 +2335,12 @@ class SVD : public Primitive {
 
   DEFINE_VMAP()
   DEFINE_PRINT(SVD)
+  auto state() const {
+    return compute_uv_;
+  }
+
+ private:
+  bool compute_uv_;
 };
 
 /* Matrix inversion primitive. */
@@ -2324,13 +2381,35 @@ class Cholesky : public UnaryPrimitive {
   bool upper_;
 };
 
+class Eig : public Primitive {
+ public:
+  explicit Eig(Stream stream, bool compute_eigenvectors)
+      : Primitive(stream), compute_eigenvectors_(compute_eigenvectors) {}
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_VMAP()
+  DEFINE_PRINT(Eig)
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+  auto state() const {
+    return compute_eigenvectors_;
+  }
+
+ private:
+  bool compute_eigenvectors_;
+};
+
 class Eigh : public Primitive {
  public:
   explicit Eigh(Stream stream, std::string uplo, bool compute_eigenvectors)
       : Primitive(stream),
         uplo_(std::move(uplo)),
         compute_eigenvectors_(compute_eigenvectors) {}
-
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
@@ -2349,6 +2428,18 @@ class Eigh : public Primitive {
  private:
   std::string uplo_;
   bool compute_eigenvectors_;
+};
+
+/* LU Factorization primitive. */
+class LUF : public Primitive {
+ public:
+  explicit LUF(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_PRINT(LUF)
 };
 
 } // namespace mlx::core

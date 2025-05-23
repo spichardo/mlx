@@ -1,14 +1,17 @@
 // Copyright © 2023-2024 Apple Inc.
 #include "mlx/backend/metal/allocator.h"
 #include "mlx/backend/metal/metal.h"
-#include "mlx/backend/metal/metal_impl.h"
 #include "mlx/backend/metal/resident.h"
+#include "mlx/memory.h"
 
 #include <mach/vm_page_size.h>
 #include <unistd.h>
 #include <cstdlib>
 
 namespace mlx::core {
+
+constexpr size_t resource_options =
+    MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked;
 
 namespace allocator {
 
@@ -17,6 +20,9 @@ Allocator& allocator() {
 }
 
 void* Buffer::raw_ptr() {
+  if (!ptr_) {
+    return nullptr;
+  }
   return static_cast<MTL::Buffer*>(ptr_)->contents();
 }
 
@@ -26,8 +32,11 @@ namespace metal {
 
 namespace {
 
-BufferCache::BufferCache(MTL::Device* device)
-    : device_(device), head_(nullptr), tail_(nullptr), pool_size_(0) {}
+BufferCache::BufferCache(ResidencySet& residency_set)
+    : head_(nullptr),
+      tail_(nullptr),
+      pool_size_(0),
+      residency_set_(residency_set) {}
 
 BufferCache::~BufferCache() {
   auto pool = metal::new_scoped_memory_pool();
@@ -38,6 +47,9 @@ int BufferCache::clear() {
   int n_release = 0;
   for (auto& [size, holder] : buffer_pool_) {
     if (holder->buf) {
+      if (!holder->buf->heap()) {
+        residency_set_.erase(holder->buf);
+      }
       holder->buf->release();
       n_release++;
     }
@@ -95,6 +107,9 @@ int BufferCache::release_cached_buffers(size_t min_bytes_to_free) {
     while (tail_ && (total_bytes_freed < min_bytes_to_free)) {
       if (tail_->buf) {
         total_bytes_freed += tail_->buf->length();
+        if (!tail_->buf->heap()) {
+          residency_set_.erase(tail_->buf);
+        }
         tail_->buf->release();
         tail_->buf = nullptr;
         n_release++;
@@ -149,16 +164,35 @@ void BufferCache::remove_from_list(BufferCache::BufferHolder* to_remove) {
 MetalAllocator::MetalAllocator()
     : device_(device(mlx::core::Device::gpu).mtl_device()),
       residency_set_(device_),
-      buffer_cache_(device_) {
-  auto memsize = std::get<size_t>(device_info()["memory_size"]);
+      buffer_cache_(residency_set_) {
+  auto pool = metal::new_scoped_memory_pool();
+  auto memsize = std::get<size_t>(device_info().at("memory_size"));
   auto max_rec_size =
-      std::get<size_t>(device_info()["max_recommended_working_set_size"]);
-  resource_limit_ = std::get<size_t>(device_info()["resource_limit"]);
+      std::get<size_t>(device_info().at("max_recommended_working_set_size"));
+  resource_limit_ = std::get<size_t>(device_info().at("resource_limit"));
   block_limit_ = std::min(1.5 * max_rec_size, 0.95 * memsize);
   gc_limit_ = std::min(static_cast<size_t>(0.95 * max_rec_size), block_limit_);
   max_pool_size_ = block_limit_;
   device(mlx::core::Device::gpu)
       .set_residency_set(residency_set_.mtl_residency_set());
+  bool is_vm = std::get<std::string>(device_info().at("device_name")) ==
+      "Apple Paravirtual device";
+  if (is_vm) {
+    return;
+  }
+  auto heap_desc = MTL::HeapDescriptor::alloc()->init();
+  heap_desc->setResourceOptions(resource_options);
+  heap_desc->setSize(heap_size_);
+  heap_ = device_->newHeap(heap_desc);
+  heap_desc->release();
+  residency_set_.insert(heap_);
+}
+
+MetalAllocator::~MetalAllocator() {
+  auto pool = metal::new_scoped_memory_pool();
+  if (heap_) {
+    heap_->release();
+  }
 }
 
 size_t MetalAllocator::set_cache_limit(size_t limit) {
@@ -167,15 +201,18 @@ size_t MetalAllocator::set_cache_limit(size_t limit) {
   return limit;
 };
 
-size_t MetalAllocator::set_memory_limit(size_t limit, bool relaxed) {
+size_t MetalAllocator::set_memory_limit(size_t limit) {
   std::unique_lock lk(mutex_);
   std::swap(limit, block_limit_);
-  relaxed_ = relaxed;
   gc_limit_ = std::min(
       block_limit_,
       static_cast<size_t>(0.95 * device_->recommendedMaxWorkingSetSize()));
   return limit;
 };
+
+size_t MetalAllocator::get_memory_limit() {
+  return block_limit_;
+}
 
 size_t MetalAllocator::set_wired_limit(size_t limit) {
   std::unique_lock lk(mutex_);
@@ -184,7 +221,7 @@ size_t MetalAllocator::set_wired_limit(size_t limit) {
   return limit;
 };
 
-Buffer MetalAllocator::malloc(size_t size, bool allow_swap /* = false */) {
+Buffer MetalAllocator::malloc(size_t size) {
   // Metal doesn't like empty buffers
   if (size == 0) {
     return Buffer{nullptr};
@@ -211,11 +248,6 @@ Buffer MetalAllocator::malloc(size_t size, bool allow_swap /* = false */) {
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
-    // If there is too much memory pressure, fail (likely causes a wait).
-    if (!(allow_swap && relaxed_) && mem_required >= block_limit_) {
-      return Buffer{nullptr};
-    }
-
     auto pool = metal::new_scoped_memory_pool();
 
     // If we have a lot of memory pressure or are over the maximum cache size,
@@ -226,8 +258,6 @@ Buffer MetalAllocator::malloc(size_t size, bool allow_swap /* = false */) {
     }
 
     // Allocate new buffer if needed
-    size_t res_opt = MTL::ResourceStorageModeShared;
-    res_opt |= MTL::ResourceHazardTrackingModeUntracked;
     if (num_resources_ >= resource_limit_) {
       std::ostringstream msg;
       msg << "[metal::malloc] Resource limit (" << resource_limit_
@@ -235,10 +265,19 @@ Buffer MetalAllocator::malloc(size_t size, bool allow_swap /* = false */) {
       throw std::runtime_error(msg.str());
     }
     lk.unlock();
-    buf = device_->newBuffer(size, res_opt);
+    if (size < small_size_ && heap_) {
+      buf = heap_->newBuffer(size, resource_options);
+    }
+    if (!buf) {
+      buf = device_->newBuffer(size, resource_options);
+    }
+    if (!buf) {
+      return Buffer{nullptr};
+    }
     lk.lock();
-    if (buf) {
-      num_resources_++;
+    num_resources_++;
+    if (!buf->heap()) {
+      residency_set_.insert(buf);
     }
   }
 
@@ -246,13 +285,11 @@ Buffer MetalAllocator::malloc(size_t size, bool allow_swap /* = false */) {
   peak_memory_ = std::max(peak_memory_, active_memory_);
 
   // Maintain the cache below the requested limit
-  if (get_cache_memory() >= max_pool_size_) {
+  if (get_cache_memory() > max_pool_size_) {
     auto pool = metal::new_scoped_memory_pool();
     num_resources_ -= buffer_cache_.release_cached_buffers(
         get_cache_memory() - max_pool_size_);
   }
-
-  residency_set_.insert(buf);
 
   return Buffer{static_cast<void*>(buf)};
 }
@@ -269,12 +306,14 @@ void MetalAllocator::free(Buffer buffer) {
     return;
   }
   std::unique_lock lk(mutex_);
-  residency_set_.erase(buf);
   active_memory_ -= buf->length();
   if (get_cache_memory() < max_pool_size_) {
     buffer_cache_.recycle_to_cache(buf);
   } else {
     num_resources_--;
+    if (!buf->heap()) {
+      residency_set_.erase(buf);
+    }
     lk.unlock();
     auto pool = metal::new_scoped_memory_pool();
     buf->release();
@@ -293,37 +332,40 @@ MetalAllocator& allocator() {
   return *allocator_;
 }
 
+} // namespace metal
+
 size_t set_cache_limit(size_t limit) {
-  return allocator().set_cache_limit(limit);
+  return metal::allocator().set_cache_limit(limit);
 }
-size_t set_memory_limit(size_t limit, bool relaxed /* = true */) {
-  return allocator().set_memory_limit(limit, relaxed);
+size_t set_memory_limit(size_t limit) {
+  return metal::allocator().set_memory_limit(limit);
+}
+size_t get_memory_limit() {
+  return metal::allocator().get_memory_limit();
 }
 size_t set_wired_limit(size_t limit) {
-  if (limit >
-      std::get<size_t>(device_info()["max_recommended_working_set_size"])) {
+  if (limit > std::get<size_t>(metal::device_info().at(
+                  "max_recommended_working_set_size"))) {
     throw std::invalid_argument(
         "[metal::set_wired_limit] Setting a wired limit larger than "
         "the maximum working set size is not allowed.");
   }
-  return allocator().set_wired_limit(limit);
+  return metal::allocator().set_wired_limit(limit);
 }
 size_t get_active_memory() {
-  return allocator().get_active_memory();
+  return metal::allocator().get_active_memory();
 }
 size_t get_peak_memory() {
-  return allocator().get_peak_memory();
+  return metal::allocator().get_peak_memory();
 }
 void reset_peak_memory() {
-  allocator().reset_peak_memory();
+  metal::allocator().reset_peak_memory();
 }
 size_t get_cache_memory() {
-  return allocator().get_cache_memory();
+  return metal::allocator().get_cache_memory();
 }
 void clear_cache() {
-  return allocator().clear_cache();
+  return metal::allocator().clear_cache();
 }
-
-} // namespace metal
 
 } // namespace mlx::core

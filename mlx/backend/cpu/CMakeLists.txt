@@ -40,11 +40,15 @@ add_dependencies(mlx cpu_compiled_preamble)
 
 target_sources(
   mlx
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/available.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/eig.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/eigh.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/encoder.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
@@ -56,21 +60,24 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/select.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/threefry.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/luf.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/qrf.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/svd.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/inverse.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_BINARY_DIR}/compiled_preamble.cpp)
 
 if(MLX_BUILD_ACCELERATE)
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/bnns.cpp)
 else()
-  target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/no_fp16.cpp
-                             ${CMAKE_CURRENT_SOURCE_DIR}/gemms/no_bf16.cpp)
+  target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_fp16.cpp
+                             ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_bf16.cpp)
 endif()
 
 if(IOS)

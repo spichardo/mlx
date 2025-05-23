@@ -14,13 +14,6 @@ namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
 
-namespace {
-nb::tuple svd_helper(const mx::array& a, mx::StreamOrDevice s /* = {} */) {
-  const auto result = mx::linalg::svd(a, s);
-  return nb::make_tuple(result.at(0), result.at(1), result.at(2));
-}
-} // namespace
-
 void init_linalg(nb::module_& parent_module) {
   auto m = parent_module.def_submodule(
       "linalg", "mlx.core.linalg: linear algebra routines.");
@@ -99,6 +92,7 @@ void init_linalg(nb::module_& parent_module) {
           =====  ============================  ==========================
           None   Frobenius norm                2-norm
           'fro'  Frobenius norm                --
+          'nuc'  nuclear norm                  --
           inf    max(sum(abs(x), axis=1))      max(abs(x))
           -inf   min(sum(abs(x), axis=1))      min(abs(x))
           0      --                            sum(x != 0)
@@ -108,9 +102,6 @@ void init_linalg(nb::module_& parent_module) {
           -2     smallest singular value       as below
           other  --                            sum(abs(x)**ord)**(1./ord)
           =====  ============================  ==========================
-
-          .. warning::
-            Nuclear norm and norms based on singular values are not yet implemented.
 
           The Frobenius norm is given by [1]_:
 
@@ -213,12 +204,22 @@ void init_linalg(nb::module_& parent_module) {
       )pbdoc");
   m.def(
       "svd",
-      &svd_helper,
+      [](const mx::array& a,
+         bool compute_uv /* = true */,
+         mx::StreamOrDevice s /* = {} */) -> nb::object {
+        const auto result = mx::linalg::svd(a, compute_uv, s);
+        if (result.size() == 1) {
+          return nb::cast(result.at(0));
+        } else {
+          return nb::make_tuple(result.at(0), result.at(1), result.at(2));
+        }
+      },
       "a"_a,
+      "compute_uv"_a = true,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def svd(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array, array]"),
+          "def svd(a: array, compute_uv: bool = True, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array, array]"),
       R"pbdoc(
         The Singular Value Decomposition (SVD) of the input matrix.
 
@@ -228,12 +229,15 @@ void init_linalg(nb::module_& parent_module) {
 
         Args:
             a (array): Input array.
+            compute_uv (bool, optional): If ``True``, return the ``U``, ``S``, and ``Vt`` components.
+              If ``False``, return only the ``S`` array. Default: ``True``.
             stream (Stream, optional): Stream or device. Defaults to ``None``
               in which case the default stream of the default device is used.
 
         Returns:
-            tuple(array, array, array): The ``U``, ``S``, and ``Vt`` matrices, such that
-            ``A = U @ diag(S) @ Vt``
+            Union[tuple(array, ...), array]:
+              If compute_uv is ``True`` returns the ``U``, ``S``, and ``Vt`` matrices, such that
+              ``A = U @ diag(S) @ Vt``. If compute_uv is ``False`` returns singular values array ``S``.
       )pbdoc");
   m.def(
       "inv",
@@ -262,7 +266,7 @@ void init_linalg(nb::module_& parent_module) {
       "tri_inv",
       &mx::linalg::tri_inv,
       "a"_a,
-      "upper"_a,
+      "upper"_a = false,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
@@ -276,7 +280,7 @@ void init_linalg(nb::module_& parent_module) {
 
         Args:
             a (array): Input array.
-            upper (array): Whether the array is upper or lower triangular. Defaults to ``False``.
+            upper (bool, optional): Whether the array is upper or lower triangular. Defaults to ``False``.
             stream (Stream, optional): Stream or device. Defaults to ``None``
               in which case the default stream of the default device is used.
 
@@ -404,6 +408,76 @@ void init_linalg(nb::module_& parent_module) {
             array: The cross product of ``a`` and ``b`` along the specified axis.
       )pbdoc");
   m.def(
+      "eigvals",
+      &mx::linalg::eigvals,
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Compute the eigenvalues of a square matrix.
+
+        This function differs from :func:`numpy.linalg.eigvals` in that the
+        return type is always complex even if the eigenvalues are all real.
+
+        This function supports arrays with at least 2 dimensions. When the
+        input has more than two dimensions, the eigenvalues are computed for
+        each matrix in the last two dimensions.
+
+        Args:
+            a (array): The input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            array: The eigenvalues (not necessarily in order).
+
+        Example:
+            >>> A = mx.array([[1., -2.], [-2., 1.]])
+            >>> eigenvalues = mx.linalg.eigvals(A, stream=mx.cpu)
+            >>> eigenvalues
+            array([3+0j, -1+0j], dtype=complex64)
+      )pbdoc");
+  m.def(
+      "eig",
+      [](const mx::array& a, mx::StreamOrDevice s) {
+        auto result = mx::linalg::eig(a, s);
+        return nb::make_tuple(result.first, result.second);
+      },
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Compute the eigenvalues and eigenvectors of a square matrix.
+
+        This function differs from :func:`numpy.linalg.eig` in that the
+        return type is always complex even if the eigenvalues are all real.
+
+        This function supports arrays with at least 2 dimensions. When the input
+        has more than two dimensions, the eigenvalues and eigenvectors are
+        computed for each matrix in the last two dimensions.
+
+        Args:
+            a (array): The input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            Tuple[array, array]:
+              A tuple containing the eigenvalues and the normalized right
+              eigenvectors. The column ``v[:, i]`` is the eigenvector
+              corresponding to the i-th eigenvalue.
+
+        Example:
+            >>> A = mx.array([[1., -2.], [-2., 1.]])
+            >>> w, v = mx.linalg.eig(A, stream=mx.cpu)
+            >>> w
+            array([3+0j, -1+0j], dtype=complex64)
+            >>> v
+            array([[0.707107+0j, 0.707107+0j],
+                   [-0.707107+0j, 0.707107+0j]], dtype=complex64)
+      )pbdoc");
+
+  m.def(
       "eigvalsh",
       &mx::linalg::eigvalsh,
       "a"_a,
@@ -441,7 +515,6 @@ void init_linalg(nb::module_& parent_module) {
   m.def(
       "eigh",
       [](const mx::array& a, const std::string UPLO, mx::StreamOrDevice s) {
-        // TODO avoid cast?
         auto result = mx::linalg::eigh(a, UPLO, s);
         return nb::make_tuple(result.first, result.second);
       },
@@ -483,5 +556,103 @@ void init_linalg(nb::module_& parent_module) {
             >>> v
             array([[ 0.707107, -0.707107],
                   [ 0.707107,  0.707107]], dtype=float32)
+      )pbdoc");
+  m.def(
+      "lu",
+      [](const mx::array& a, mx::StreamOrDevice s /* = {} */) {
+        auto result = mx::linalg::lu(a, s);
+        return nb::make_tuple(result.at(0), result.at(1), result.at(2));
+      },
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lu(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array, array]"),
+      R"pbdoc(
+        Compute the LU factorization of the given matrix ``A``.
+
+        Note, unlike the default behavior of ``scipy.linalg.lu``, the pivots
+        are indices. To reconstruct the input use ``L[P, :] @ U`` for 2
+        dimensions or ``mx.take_along_axis(L, P[..., None], axis=-2) @ U``
+        for more than 2 dimensions.
+
+        To construct the full permuation matrix do:
+
+        .. code-block::
+
+          P = mx.put_along_axis(mx.zeros_like(L), p[..., None], mx.array(1.0), axis=-1)
+
+        Args:
+            a (array): Input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            tuple(array, array, array):
+              The ``p``, ``L``, and ``U`` arrays, such that ``A = L[P, :] @ U``
+      )pbdoc");
+  m.def(
+      "lu_factor",
+      &mx::linalg::lu_factor,
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lu_factor(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Computes a compact representation of the LU factorization.
+
+        Args:
+            a (array): Input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            tuple(array, array): The ``LU`` matrix and ``pivots`` array.
+      )pbdoc");
+  m.def(
+      "solve",
+      &mx::linalg::solve,
+      "a"_a,
+      "b"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def solve(a: array, b: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Compute the solution to a system of linear equations ``AX = B``.
+
+        Args:
+            a (array): Input array.
+            b (array): Input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            array: The unique solution to the system ``AX = B``.
+      )pbdoc");
+  m.def(
+      "solve_triangular",
+      &mx::linalg::solve_triangular,
+      "a"_a,
+      "b"_a,
+      nb::kw_only(),
+      "upper"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def solve_triangular(a: array, b: array, *, upper: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Computes the solution of a triangular system of linear equations ``AX = B``.
+
+        Args:
+            a (array): Input array.
+            b (array): Input array.
+            upper (bool, optional): Whether the array is upper or lower
+              triangular. Default: ``False``.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            array: The unique solution to the system ``AX = B``.
       )pbdoc");
 }

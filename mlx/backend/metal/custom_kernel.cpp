@@ -1,6 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
-#include "mlx/backend/metal/copy.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
@@ -19,7 +19,7 @@ void CustomKernel::eval_gpu(
       copies.emplace_back(init_value_.value(), out.dtype());
       fill_gpu(copies.back(), out, s);
     } else {
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
+      out.set_data(allocator::malloc(out.nbytes()));
     }
   }
 

@@ -9,6 +9,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 
 namespace mlx::core::fast {
 
@@ -54,30 +55,34 @@ std::pair<std::vector<array>, std::vector<int>> Custom::vmap(
 
 array rms_norm(
     const array& x,
-    const array& weight,
+    const std::optional<array>& weight,
     float eps,
     StreamOrDevice s_ /* = {} */) {
+  bool has_weight = weight.has_value();
+
   if (x.ndim() == 0) {
     std::ostringstream msg;
     msg << "[rms_norm] Input must have at least 1 dimension but got input with "
            "0 dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (weight.ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[rms_norm] weight must have 1 dimension but has " << weight.ndim()
-        << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  if (weight.size() != x.shape(-1)) {
-    std::ostringstream msg;
-    msg << "[rms_norm] weight must have the same size as the last dimension of"
-           " x but has "
-        << weight.size() << " elements.";
-    throw std::invalid_argument(msg.str());
+  if (has_weight) {
+    if ((*weight).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have 1 dimension but has "
+          << (*weight).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*weight).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
+             " x but has "
+          << (*weight).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
 
-  auto out_type = result_type(x, weight);
+  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
     msg << "[rms_norm] Received unsupported type " << out_type << ".";
@@ -85,27 +90,36 @@ array rms_norm(
   }
 
   auto s = to_stream(s_);
-  auto fallback = [eps, out_type, s](const std::vector<array>& inputs) {
-    auto x = astype(inputs[0], float32, s);
-    x = multiply(
-        x,
-        rsqrt(
-            add(mean(square(x, s), -1, /* keepdims */ true, s),
-                array(eps, float32),
+  auto fallback =
+      [has_weight, eps, out_type, s](const std::vector<array>& inputs) {
+        auto x = astype(inputs[0], float32, s);
+        x = multiply(
+            x,
+            rsqrt(
+                add(mean(square(x, s), -1, /* keepdims */ true, s),
+                    array(eps, float32),
+                    s),
                 s),
-            s),
-        s);
-    x = astype(x, out_type, s);
-    return std::vector<array>{multiply(inputs[1], x, s)};
-  };
+            s);
+        x = astype(x, out_type, s);
+
+        if (has_weight) {
+          x = multiply(x, inputs[1], s);
+        }
+
+        return std::vector<array>{x};
+      };
+
+  auto passed_weight =
+      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
   if (s.device == Device::gpu) {
     return array(
         x.shape(),
         out_type,
         std::make_shared<RMSNorm>(s, fallback, eps),
-        {astype(x, out_type, s), astype(weight, out_type, s)});
+        {astype(x, out_type, s), passed_weight});
   }
-  return fallback({x, weight})[0];
+  return fallback({x, passed_weight})[0];
 }
 
 std::vector<array> RMSNorm::vjp(
@@ -141,8 +155,12 @@ std::vector<array> RMSNorm::vjp(
     // df/dw
     std::vector<int> axes(g.ndim() - 1);
     std::iota(axes.begin(), axes.end(), 0);
-    vjps.push_back(
-        sum(multiply(g, multiply(x, n, s), s), axes, /* keepdims= */ false, s));
+    if (w.ndim() == 0) {
+      vjps.push_back(zeros_like(w, s));
+    } else {
+      vjps.push_back(sum(
+          multiply(g, multiply(x, n, s), s), axes, /* keepdims= */ false, s));
+    }
 
     return vjps;
   };
@@ -177,28 +195,30 @@ array layer_norm(
     const std::optional<array>& bias,
     float eps,
     StreamOrDevice s_ /* = {} */) {
+  bool has_weight = weight.has_value();
+  bool has_bias = bias.has_value();
+
   if (x.ndim() == 0) {
     std::ostringstream msg;
     msg << "[layer_norm] Input must have at least 1 dimension but got input with "
            "0 dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (weight.has_value() && (*weight).ndim() != 1) {
+  if (has_weight && (*weight).ndim() != 1) {
     std::ostringstream msg;
     msg << "[layer_norm] weight must have 1 dimension but has "
         << (*weight).ndim() << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (bias.has_value() && (*bias).ndim() != 1) {
+  if (has_bias && (*bias).ndim() != 1) {
     std::ostringstream msg;
     msg << "[layer_norm] bias must have 1 dimension but has " << (*bias).ndim()
         << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
 
-  auto out_type = (weight.has_value())
-      ? ((bias.has_value()) ? result_type(x, *weight, *bias)
-                            : result_type(x, *weight))
+  auto out_type = (has_weight)
+      ? ((has_bias) ? result_type(x, *weight, *bias) : result_type(x, *weight))
       : x.dtype();
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
@@ -207,8 +227,6 @@ array layer_norm(
   }
 
   auto s = to_stream(s_);
-  bool has_weight = weight.has_value();
-  bool has_bias = bias.has_value();
   auto fallback = [has_weight, has_bias, eps, out_type, s](
                       const std::vector<array>& inputs) {
     auto x = astype(inputs[0], float32, s);
@@ -234,9 +252,9 @@ array layer_norm(
   };
 
   auto passed_weight =
-      astype((weight.has_value()) ? *weight : array(1, out_type), out_type);
+      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
   auto passed_bias =
-      astype((bias.has_value()) ? *bias : array(0, out_type), out_type);
+      (has_bias) ? astype(*bias, out_type, s) : array(0, out_type);
 
   if (s.device == Device::gpu) {
     return array(
@@ -346,6 +364,11 @@ array rope(
     std::ostringstream msg;
     msg << "[rope] Input must have at least 3 dimensions but got input with "
         << x.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!issubdtype(x.dtype(), floating)) {
+    std::ostringstream msg;
+    msg << "[rope] Input must be a floating type but got " << x.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (offset.size() != 1) {
@@ -545,9 +568,9 @@ array scaled_dot_product_attention(
     const array& keys,
     const array& values,
     const float scale,
-    const std::optional<array>& mask,
-    const std::optional<int> memory_efficient_threshold,
-    StreamOrDevice s) {
+    const std::string& mask_mode /* = "" */,
+    const std::vector<array>& mask_arrs /* = {} */,
+    StreamOrDevice s /* = {}*/) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -556,10 +579,49 @@ array scaled_dot_product_attention(
       throw std::invalid_argument(msg.str());
     }
   }
-  if (mask && (*mask).ndim() > 4) {
+  // Check valid mask
+  if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] Invalid mask_mode " << mask_mode
+        << ". mask_mode must be 'causal', 'array' or ''.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  bool do_causal = false;
+  bool has_mask = false;
+  bool has_arr_mask = false;
+  bool has_bool_mask = false;
+
+  if (mask_mode == "causal") {
+    has_mask = true;
+    do_causal = true;
+
+    if (!mask_arrs.empty()) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Invalid mask_arrs for mask_mode "
+          << "'casusal'. No array masks supported.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  if (mask_mode == "array" || (mask_mode == "" && !mask_arrs.empty())) {
+    if (mask_arrs.size() != 1) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Invalid mask_arrs for mask_mode "
+          << "'" << mask_mode << "'. Only 1 mask array is supported, got "
+          << mask_arrs.size() << "arrays.";
+      throw std::invalid_argument(msg.str());
+    }
+
+    has_mask = true;
+    has_arr_mask = true;
+    has_bool_mask = mask_arrs[0].dtype() == bool_;
+  }
+
+  if (has_arr_mask && (mask_arrs[0]).ndim() > 4) {
     std::ostringstream msg;
     msg << "[scaled_dot_product_attention] the mask with shape "
-        << (*mask).shape() << " expected to have at most rank 4";
+        << mask_arrs[0].shape() << " expected to have at most rank 4.";
     throw std::invalid_argument(msg.str());
   }
 
@@ -609,38 +671,11 @@ array scaled_dot_product_attention(
     throw std::invalid_argument(msg.str());
   }
 
-  if (mask) {
-    // Check type
-    if (promote_types(mask->dtype(), final_type) != final_type) {
-      std::ostringstream msg;
-      msg << "[scaled_dot_product_attention] Mask type must promote to output type. "
-          << final_type << ".";
-      throw std::invalid_argument(msg.str());
-    }
-    // Check shape
-    auto mask_shape = queries.shape();
-    mask_shape.back() = keys.shape(-2);
-    if (broadcast_shapes(mask->shape(), mask_shape) != mask_shape) {
-      std::ostringstream msg;
-      msg << "[scaled_dot_product_attention] Mask with shape " << mask->shape()
-          << " does not broadcast to implicit scores with shape " << mask_shape
-          << ".";
-      throw std::invalid_argument(msg.str());
-    }
-  }
-
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
   auto v = astype(values, final_type, s);
 
-  /* Generic implementation for use cases that Metal implementation does not
-   * support. */
-  int threshold = 32; // TODO: Fix after dev
-  if (memory_efficient_threshold.has_value()) {
-    threshold = std::max(1, memory_efficient_threshold.value());
-  }
-
-  auto fallback = [scale, final_type, n_q_heads, n_kv_heads, s](
+  auto fallback = [scale, final_type, n_q_heads, n_kv_heads, do_causal, s](
                       const std::vector<array>& inputs) {
     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
@@ -654,9 +689,21 @@ array scaled_dot_product_attention(
       v = expand_dims(v, 2, s);
     }
     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    if (inputs.size() > 3) {
+    if (inputs.size() > 3 || do_causal) {
       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
-      auto mask = inputs[3];
+      auto mask = inputs.back();
+
+      if (do_causal) {
+        int kL = k.shape(-2);
+        int qL = q.shape(-2);
+        int q_off = (kL - qL) < 0 ? 0 : (kL - qL);
+        auto q_idx = arange(q_off, q_off + qL, s);
+        auto k_idx = arange(0, kL, s);
+        q_idx = expand_dims(q_idx, 1, s);
+        k_idx = expand_dims(k_idx, 0, s);
+        mask = greater_equal(q_idx, k_idx, s);
+      }
+
       if (n_repeats > 1 && mask.ndim() >= 3) {
         if (mask.shape(-3) == 1) {
           mask = expand_dims(mask, -3, s);
@@ -680,36 +727,56 @@ array scaled_dot_product_attention(
   };
 
   auto stream = to_stream(s);
-  const size_t value_head_dim = v.shape(-1);
-  const size_t query_head_dim = q.shape(-1);
-  const size_t query_sequence_length = q.shape(2);
+  const int value_head_dim = v.shape(-1);
+  const int query_head_dim = q.shape(-1);
+  const int query_sequence_length = q.shape(2);
+  const int key_sequence_length = k.shape(2);
 
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256);
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80);
+      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
 
-  const bool supports_sdpa_full = query_sequence_length >= threshold && !mask &&
+  const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
+      (query_sequence_length <= key_sequence_length && do_causal);
+
+  const bool supports_sdpa_full = sdpa_full_supported_mask &&
       sdpa_full_supported_head_dim && stream.device == Device::gpu;
 
-  const bool supports_sdpa_vector = query_sequence_length == 1 &&
-      (!mask || mask->dtype() == bool_) && sdpa_vector_supported_head_dim &&
-      stream.device == Device::gpu;
+  const bool supports_sdpa_vector = (query_sequence_length <= 8) &&
+      (query_sequence_length <= key_sequence_length) &&
+      sdpa_vector_supported_head_dim && stream.device == Device::gpu;
 
   const bool implementation_supports_use_case =
       supports_sdpa_full || supports_sdpa_vector;
 
   std::vector<array> inputs = {q, k, v};
-  if (mask) {
-    inputs.push_back(*mask);
+  if (has_arr_mask) {
+    // Check type
+    auto mask_arr = mask_arrs[0];
+    has_bool_mask = mask_arr.dtype() == bool_;
+    if (promote_types(mask_arr.dtype(), final_type) != final_type) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Mask type must promote to output type. "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    } else if (!has_bool_mask) {
+      mask_arr = astype(mask_arr, final_type, stream);
+    }
+    // Broadcast mask
+    auto mask_shape = queries.shape();
+    mask_shape.back() = keys.shape(-2);
+    inputs.push_back(broadcast_to(mask_arr, mask_shape, stream));
   }
-  if (implementation_supports_use_case) {
+  if (!detail::in_grad_tracing() && implementation_supports_use_case) {
     auto out_shape = Shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     return array(
         std::move(out_shape),
         final_type,
-        std::make_shared<ScaledDotProductAttention>(stream, fallback, scale),
+        std::make_shared<ScaledDotProductAttention>(
+            stream, fallback, scale, do_causal),
         std::move(inputs));
   }
   return fallback(inputs)[0];
@@ -718,7 +785,7 @@ array scaled_dot_product_attention(
 bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   const ScaledDotProductAttention& a_other =
       static_cast<const ScaledDotProductAttention&>(other);
-  return scale_ == a_other.scale_;
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_;
 }
 
 array pack_and_quantize(
@@ -804,14 +871,17 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
     auto wshape = w.shape();
     wshape.back() = -1;
 
-    array zero(0, w.dtype());
-    array n_bins((1 << bits) - 1, w.dtype()); // 2**bits - 1
-    array eps(1e-7, w.dtype());
+    array zero(0, float32);
+    array n_bins((1 << bits) - 1, float32); // 2**bits - 1
+    array eps(1e-7, float32);
 
     array packed_w = reshape(w, {-1, w.shape(-1) / group_size, group_size}, s);
 
     array w_max = max(packed_w, /* axis= */ -1, /* keepdims= */ true, s);
     array w_min = min(packed_w, /* axis= */ -1, /* keepdims= */ true, s);
+    w_max = astype(w_max, float32, s);
+    w_min = astype(w_min, float32, s);
+
     array mask = greater(abs(w_min, s), abs(w_max, s), s);
     array scales =
         maximum(divide(subtract(w_max, w_min, s), n_bins, s), eps, s);
@@ -822,6 +892,9 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
     array biases = where(equal(q0, zero, s), zero, edge, s);
 
     packed_w = pack_and_quantize(packed_w, scales, biases, bits, s);
+
+    scales = astype(scales, w.dtype(), s);
+    biases = astype(biases, w.dtype(), s);
     return {
         reshape(packed_w, wshape, s),
         reshape(scales, wshape, s),

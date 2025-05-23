@@ -62,7 +62,11 @@ norm(const array& a, int axis, bool keepdims = false, StreamOrDevice s = {}) {
 
 std::pair<array, array> qr(const array& a, StreamOrDevice s = {});
 
-std::vector<array> svd(const array& a, StreamOrDevice s = {});
+std::vector<array>
+svd(const array& a, bool compute_uv, StreamOrDevice s /* = {} */);
+inline std::vector<array> svd(const array& a, StreamOrDevice s = {}) {
+  return svd(a, true, s);
+}
 
 array inv(const array& a, StreamOrDevice s = {});
 
@@ -74,6 +78,18 @@ array pinv(const array& a, StreamOrDevice s = {});
 
 array cholesky_inv(const array& a, bool upper = false, StreamOrDevice s = {});
 
+std::vector<array> lu(const array& a, StreamOrDevice s = {});
+
+std::pair<array, array> lu_factor(const array& a, StreamOrDevice s = {});
+
+array solve(const array& a, const array& b, StreamOrDevice s = {});
+
+array solve_triangular(
+    const array& a,
+    const array& b,
+    bool upper = false,
+    StreamOrDevice s = {});
+
 /**
  * Compute the cross product of two arrays along the given axis.
  */
@@ -82,6 +98,10 @@ array cross(
     const array& b,
     int axis = -1,
     StreamOrDevice s = {});
+
+std::pair<array, array> eig(const array& a, StreamOrDevice s = {});
+
+array eigvals(const array& a, StreamOrDevice s = {});
 
 array eigvalsh(const array& a, std::string UPLO = "L", StreamOrDevice s = {});
 

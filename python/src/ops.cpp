@@ -2383,6 +2383,43 @@ void init_ops(nb::module_& m) {
             array: The output array with the corresponding axes reduced.
       )pbdoc");
   m.def(
+      "logcumsumexp",
+      [](const mx::array& a,
+         std::optional<int> axis,
+         bool reverse,
+         bool inclusive,
+         mx::StreamOrDevice s) {
+        if (axis) {
+          return mx::logcumsumexp(a, *axis, reverse, inclusive, s);
+        } else {
+          return mx::logcumsumexp(
+              mx::reshape(a, {-1}, s), 0, reverse, inclusive, s);
+        }
+      },
+      nb::arg(),
+      "axis"_a = nb::none(),
+      nb::kw_only(),
+      "reverse"_a = false,
+      "inclusive"_a = true,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def logcumsumexp(a: array, /, axis: Optional[int] = None, *, reverse: bool = False, inclusive: bool = True, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Return the cumulative logsumexp of the elements along the given axis.
+
+        Args:
+          a (array): Input array
+          axis (int, optional): Optional axis to compute the cumulative logsumexp
+            over. If unspecified the cumulative logsumexp of the flattened array is
+            returned.
+          reverse (bool): Perform the cumulative logsumexp in reverse.
+          inclusive (bool): The i-th element of the output includes the i-th
+            element of the input.
+
+        Returns:
+          array: The output array.
+      )pbdoc");
+  m.def(
       "logsumexp",
       [](const mx::array& a,
          const IntOrVec& axis,
@@ -3418,8 +3455,8 @@ void init_ops(nb::module_& m) {
         1D convolution over an input with several channels
 
         Args:
-            input (array): Input array of shape ``(N, H, C_in)``.
-            weight (array): Weight array of shape ``(C_out, H, C_in)``.
+            input (array): Input array of shape ``(N, L, C_in)``.
+            weight (array): Weight array of shape ``(C_out, K, C_in)``.
             stride (int, optional): Kernel stride. Default: ``1``.
             padding (int, optional): Input padding. Default: ``0``.
             dilation (int, optional): Kernel dilation. Default: ``1``.
@@ -3477,7 +3514,7 @@ void init_ops(nb::module_& m) {
 
         Args:
             input (array): Input array of shape ``(N, H, W, C_in)``.
-            weight (array): Weight array of shape ``(C_out, H, W, C_in)``.
+            weight (array): Weight array of shape ``(C_out, KH, KW, C_in)``.
             stride (int or tuple(int), optional): :obj:`tuple` of size 2 with
                 kernel strides. All spatial dimensions get the same stride if
                 only one number is specified. Default: ``1``.
@@ -3549,7 +3586,7 @@ void init_ops(nb::module_& m) {
 
         Args:
             input (array): Input array of shape ``(N, D, H, W, C_in)``.
-            weight (array): Weight array of shape ``(C_out, D, H, W, C_in)``.
+            weight (array): Weight array of shape ``(C_out, KD, KH, KW, C_in)``.
             stride (int or tuple(int), optional): :obj:`tuple` of size 3 with
                 kernel strides. All spatial dimensions get the same stride if
                 only one number is specified. Default: ``1``.
@@ -3572,20 +3609,22 @@ void init_ops(nb::module_& m) {
       "stride"_a = 1,
       "padding"_a = 0,
       "dilation"_a = 1,
+      "output_padding"_a = 0,
       "groups"_a = 1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def conv_transpose1d(input: array, weight: array, /, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def conv_transpose1d(input: array, weight: array, /, stride: int = 1, padding: int = 0, dilation: int = 1, output_padding: int = 0, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         1D transposed convolution over an input with several channels
 
         Args:
-            input (array): Input array of shape ``(N, H, C_in)``.
-            weight (array): Weight array of shape ``(C_out, H, C_in)``.
+            input (array): Input array of shape ``(N, L, C_in)``.
+            weight (array): Weight array of shape ``(C_out, K, C_in)``.
             stride (int, optional): Kernel stride. Default: ``1``.
             padding (int, optional): Input padding. Default: ``0``.
             dilation (int, optional): Kernel dilation. Default: ``1``.
+            output_padding (int, optional): Output padding. Default: ``0``.
             groups (int, optional): Input feature groups. Default: ``1``.
 
         Returns:
@@ -3598,11 +3637,13 @@ void init_ops(nb::module_& m) {
          const std::variant<int, std::pair<int, int>>& stride,
          const std::variant<int, std::pair<int, int>>& padding,
          const std::variant<int, std::pair<int, int>>& dilation,
+         const std::variant<int, std::pair<int, int>>& output_padding,
          int groups,
          mx::StreamOrDevice s) {
         std::pair<int, int> stride_pair{1, 1};
         std::pair<int, int> padding_pair{0, 0};
         std::pair<int, int> dilation_pair{1, 1};
+        std::pair<int, int> output_padding_pair{0, 0};
 
         if (auto pv = std::get_if<int>(&stride); pv) {
           stride_pair = std::pair<int, int>{*pv, *pv};
@@ -3622,19 +3663,33 @@ void init_ops(nb::module_& m) {
           dilation_pair = std::get<std::pair<int, int>>(dilation);
         }
 
+        if (auto pv = std::get_if<int>(&output_padding); pv) {
+          output_padding_pair = std::pair<int, int>{*pv, *pv};
+        } else {
+          output_padding_pair = std::get<std::pair<int, int>>(output_padding);
+        }
+
         return mx::conv_transpose2d(
-            input, weight, stride_pair, padding_pair, dilation_pair, groups, s);
+            input,
+            weight,
+            stride_pair,
+            padding_pair,
+            dilation_pair,
+            output_padding_pair,
+            groups,
+            s);
       },
       nb::arg(),
       nb::arg(),
       "stride"_a = 1,
       "padding"_a = 0,
       "dilation"_a = 1,
+      "output_padding"_a = 0,
       "groups"_a = 1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def conv_transpose2d(input: array, weight: array, /, stride: Union[int, Tuple[int, int]] = 1, padding: Union[int, Tuple[int, int]] = 0, dilation: Union[int, Tuple[int, int]] = 1, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def conv_transpose2d(input: array, weight: array, /, stride: Union[int, Tuple[int, int]] = 1, padding: Union[int, Tuple[int, int]] = 0, dilation: Union[int, Tuple[int, int]] = 1, output_padding: Union[int, Tuple[int, int]] = 0, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         2D transposed convolution over an input with several channels
 
@@ -3642,7 +3697,7 @@ void init_ops(nb::module_& m) {
 
         Args:
             input (array): Input array of shape ``(N, H, W, C_in)``.
-            weight (array): Weight array of shape ``(C_out, H, W, C_in)``.
+            weight (array): Weight array of shape ``(C_out, KH, KW, C_in)``.
             stride (int or tuple(int), optional): :obj:`tuple` of size 2 with
                 kernel strides. All spatial dimensions get the same stride if
                 only one number is specified. Default: ``1``.
@@ -3652,6 +3707,9 @@ void init_ops(nb::module_& m) {
             dilation (int or tuple(int), optional): :obj:`tuple` of size 2 with
                 kernel dilation. All spatial dimensions get the same dilation
                 if only one number is specified. Default: ``1``
+            output_padding (int or tuple(int), optional): :obj:`tuple` of size 2 with
+                output padding. All spatial dimensions get the same output
+                padding if only one number is specified. Default: ``0``.
             groups (int, optional): input feature groups. Default: ``1``.
 
         Returns:
@@ -3664,11 +3722,13 @@ void init_ops(nb::module_& m) {
          const std::variant<int, std::tuple<int, int, int>>& stride,
          const std::variant<int, std::tuple<int, int, int>>& padding,
          const std::variant<int, std::tuple<int, int, int>>& dilation,
+         const std::variant<int, std::tuple<int, int, int>>& output_padding,
          int groups,
          mx::StreamOrDevice s) {
         std::tuple<int, int, int> stride_tuple{1, 1, 1};
         std::tuple<int, int, int> padding_tuple{0, 0, 0};
         std::tuple<int, int, int> dilation_tuple{1, 1, 1};
+        std::tuple<int, int, int> output_padding_tuple{0, 0, 0};
 
         if (auto pv = std::get_if<int>(&stride); pv) {
           stride_tuple = std::tuple<int, int, int>{*pv, *pv, *pv};
@@ -3688,12 +3748,20 @@ void init_ops(nb::module_& m) {
           dilation_tuple = std::get<std::tuple<int, int, int>>(dilation);
         }
 
+        if (auto pv = std::get_if<int>(&output_padding); pv) {
+          output_padding_tuple = std::tuple<int, int, int>{*pv, *pv, *pv};
+        } else {
+          output_padding_tuple =
+              std::get<std::tuple<int, int, int>>(output_padding);
+        }
+
         return mx::conv_transpose3d(
             input,
             weight,
             stride_tuple,
             padding_tuple,
             dilation_tuple,
+            output_padding_tuple,
             groups,
             s);
       },
@@ -3702,11 +3770,12 @@ void init_ops(nb::module_& m) {
       "stride"_a = 1,
       "padding"_a = 0,
       "dilation"_a = 1,
+      "output_padding"_a = 0,
       "groups"_a = 1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def conv_transpose3d(input: array, weight: array, /, stride: Union[int, Tuple[int, int, int]] = 1, padding: Union[int, Tuple[int, int, int]] = 0, dilation: Union[int, Tuple[int, int, int]] = 1, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def conv_transpose3d(input: array, weight: array, /, stride: Union[int, Tuple[int, int, int]] = 1, padding: Union[int, Tuple[int, int, int]] = 0, dilation: Union[int, Tuple[int, int, int]] = 1, output_padding: Union[int, Tuple[int, int, int]] = 0, groups: int = 1, *, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         3D transposed convolution over an input with several channels
 
@@ -3714,7 +3783,7 @@ void init_ops(nb::module_& m) {
 
         Args:
             input (array): Input array of shape ``(N, D, H, W, C_in)``.
-            weight (array): Weight array of shape ``(C_out, D, H, W, C_in)``.
+            weight (array): Weight array of shape ``(C_out, KD, KH, KW, C_in)``.
             stride (int or tuple(int), optional): :obj:`tuple` of size 3 with
                 kernel strides. All spatial dimensions get the same stride if
                 only one number is specified. Default: ``1``.
@@ -3724,6 +3793,9 @@ void init_ops(nb::module_& m) {
             dilation (int or tuple(int), optional): :obj:`tuple` of size 3 with
                 kernel dilation. All spatial dimensions get the same dilation
                 if only one number is specified. Default: ``1``
+            output_padding (int or tuple(int), optional): :obj:`tuple` of size 3 with
+                output padding. All spatial dimensions get the same output
+                padding if only one number is specified. Default: ``0``.
             groups (int, optional): input feature groups. Default: ``1``.
 
         Returns:
@@ -3924,7 +3996,7 @@ void init_ops(nb::module_& m) {
             array or dict:
                 A single array if loading from a ``.npy`` file or a dict
                 mapping names to arrays if loading from a ``.npz`` or
-                ``.safetensors`` file. If ``return_metadata` is ``True`` an
+                ``.safetensors`` file. If ``return_metadata`` is ``True`` an
                 additional dictionary of metadata will be returned.
 
         Warning:
@@ -4213,9 +4285,10 @@ void init_ops(nb::module_& m) {
       "group_size"_a = 64,
       "bits"_a = 4,
       nb::kw_only(),
+      "sorted_indices"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def gather_qmm(x: array, w: array, /, scales: array, biases: array, lhs_indices: Optional[array] = None, rhs_indices: Optional[array] = None, transpose: bool = True, group_size: int = 64, bits: int = 4, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def gather_qmm(x: array, w: array, /, scales: array, biases: array, lhs_indices: Optional[array] = None, rhs_indices: Optional[array] = None, transpose: bool = True, group_size: int = 64, bits: int = 4, *, sorted_indices: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         Perform quantized matrix multiplication with matrix-level gather.
 
@@ -4228,23 +4301,25 @@ void init_ops(nb::module_& m) {
         as ``w`` since they represent the same quantized matrix.
 
         Args:
-          x (array): Input array
-          w (array): Quantized matrix packed in unsigned integers
-          scales (array): The scales to use per ``group_size`` elements of ``w``
-          biases (array): The biases to use per ``group_size`` elements of ``w``
-          lhs_indices (array, optional): Integer indices for ``x``. Default: ``None``.
-          rhs_indices (array, optional): Integer indices for ``w``. Default: ``None``.
-          transpose (bool, optional): Defines whether to multiply with the
-            transposed ``w`` or not, namely whether we are performing
-            ``x @ w.T`` or ``x @ w``. Default: ``True``.
-          group_size (int, optional): The size of the group in ``w`` that
-            shares a scale and bias. Default: ``64``.
-          bits (int, optional): The number of bits occupied by each element in
-            ``w``. Default: ``4``.
+            x (array): Input array
+            w (array): Quantized matrix packed in unsigned integers
+            scales (array): The scales to use per ``group_size`` elements of ``w``
+            biases (array): The biases to use per ``group_size`` elements of ``w``
+            lhs_indices (array, optional): Integer indices for ``x``. Default: ``None``.
+            rhs_indices (array, optional): Integer indices for ``w``. Default: ``None``.
+            transpose (bool, optional): Defines whether to multiply with the
+              transposed ``w`` or not, namely whether we are performing
+              ``x @ w.T`` or ``x @ w``. Default: ``True``.
+            group_size (int, optional): The size of the group in ``w`` that
+              shares a scale and bias. Default: ``64``.
+            bits (int, optional): The number of bits occupied by each element in
+              ``w``. Default: ``4``.
+            sorted_indices (bool, optional): May allow a faster implementation
+              if the passed indices are sorted. Default: ``False``.
 
         Returns:
-          array: The result of the multiplication of ``x`` with ``w``
-            after gathering using ``lhs_indices`` and ``rhs_indices``.
+            array: The result of the multiplication of ``x`` with ``w``
+              after gathering using ``lhs_indices`` and ``rhs_indices``.
       )pbdoc");
   m.def(
       "tensordot",
@@ -4274,16 +4349,16 @@ void init_ops(nb::module_& m) {
         Compute the tensor dot product along the specified axes.
 
         Args:
-          a (array): Input array
-          b (array): Input array
-          axes (int or list(list(int)), optional): The number of dimensions to
-            sum over. If an integer is provided, then sum over the last
-            ``axes`` dimensions of ``a`` and the first ``axes`` dimensions of
-            ``b``. If a list of lists is provided, then sum over the
-            corresponding dimensions of ``a`` and ``b``. Default: 2.
+            a (array): Input array
+            b (array): Input array
+            axes (int or list(list(int)), optional): The number of dimensions to
+              sum over. If an integer is provided, then sum over the last
+              ``axes`` dimensions of ``a`` and the first ``axes`` dimensions of
+              ``b``. If a list of lists is provided, then sum over the
+              corresponding dimensions of ``a`` and ``b``. Default: 2.
 
         Returns:
-          array: The tensor dot product.
+            array: The tensor dot product.
       )pbdoc");
   m.def(
       "inner",
@@ -4427,9 +4502,10 @@ void init_ops(nb::module_& m) {
       "lhs_indices"_a = nb::none(),
       "rhs_indices"_a = nb::none(),
       nb::kw_only(),
+      "sorted_indices"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def gather_mm(a: array, b: array, /, lhs_indices: array, rhs_indices: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def gather_mm(a: array, b: array, /, lhs_indices: array, rhs_indices: array, *, sorted_indices: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         Matrix multiplication with matrix-level gather.
 
@@ -4448,11 +4524,16 @@ void init_ops(nb::module_& m) {
         For ``b`` with shape ``(B1, B2, ..., BS, M, K)``, ``rhs_indices``
         contains indices from the range ``[0, B1 * B2 * ... * BS)``
 
+        If only one index is passed and it is sorted, the ``sorted_indices``
+        flag can be passed for a possible faster implementation.
+
         Args:
             a (array): Input array.
             b (array): Input array.
             lhs_indices (array, optional): Integer indices for ``a``. Default: ``None``
             rhs_indices (array, optional): Integer indices for ``b``. Default: ``None``
+            sorted_indices (bool, optional): May allow a faster implementation
+              if the passed indices are sorted. Default: ``False``.
 
         Returns:
             array: The output array.
@@ -4834,6 +4915,28 @@ void init_ops(nb::module_& m) {
             array: The bitwise right shift ``a >> b``.
       )pbdoc");
   m.def(
+      "bitwise_invert",
+      [](const ScalarOrArray& a_, mx::StreamOrDevice s) {
+        auto a = to_array(a_);
+        return mx::bitwise_invert(a, s);
+      },
+      nb::arg(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def bitwise_invert(a: Union[scalar, array], stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Element-wise bitwise inverse.
+
+        Take the bitwise complement of the input.
+
+        Args:
+            a (array): Input array or scalar.
+
+        Returns:
+            array: The bitwise inverse ``~a``.
+      )pbdoc");
+  m.def(
       "view",
       [](const ScalarOrArray& a, const mx::Dtype& dtype, mx::StreamOrDevice s) {
         return mx::view(to_array(a), dtype, s);
@@ -5101,5 +5204,66 @@ void init_ops(nb::module_& m) {
           array([[0, 0, 0],
                  [0, 1, 0],
                  [0, 1, 0]], dtype=float32)
+      )pbdoc");
+  m.def(
+      "contiguous",
+      &mx::contiguous,
+      nb::arg(),
+      "allow_col_major"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def contiguous(a: array, /, allow_col_major: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+      Force an array to be row contiguous. Copy if necessary.
+
+      Args:
+        a (array): The input to make contiguous
+        allow_col_major (bool): Consider column major as contiguous and don't copy
+
+      Returns:
+        array: The row or col contiguous output.
+    )pbdoc");
+  m.def(
+      "broadcast_shapes",
+      [](const nb::args& shapes) {
+        if (shapes.size() == 0)
+          throw std::invalid_argument(
+              "[broadcast_shapes] Must provide at least one shape.");
+
+        mx::Shape result = nb::cast<mx::Shape>(shapes[0]);
+        for (size_t i = 1; i < shapes.size(); ++i) {
+          if (!nb::isinstance<mx::Shape>(shapes[i]) &&
+              !nb::isinstance<nb::tuple>(shapes[i]))
+            throw std::invalid_argument(
+                "[broadcast_shapes] Expects a sequence of shapes (tuple or list of ints).");
+          result = mx::broadcast_shapes(result, nb::cast<mx::Shape>(shapes[i]));
+        }
+
+        return nb::tuple(nb::cast(result));
+      },
+      nb::sig("def broadcast_shapes(*shapes: Sequence[int]) -> Tuple[int]"),
+      R"pbdoc(
+        Broadcast shapes.
+
+        Returns the shape that results from broadcasting the supplied array shapes
+        against each other.
+
+        Args:
+            *shapes (Sequence[int]): The shapes to broadcast.
+
+        Returns:
+            tuple: The broadcasted shape.
+
+        Raises:
+            ValueError: If the shapes cannot be broadcast.
+
+        Example:
+            >>> mx.broadcast_shapes((1,), (3, 1))
+            (3, 1)
+            >>> mx.broadcast_shapes((6, 7), (5, 6, 1), (7,))
+            (5, 6, 7)
+            >>> mx.broadcast_shapes((5, 1, 4), (1, 3, 1))
+            (5, 3, 4)
       )pbdoc");
 }

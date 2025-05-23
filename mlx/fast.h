@@ -3,6 +3,7 @@
 #pragma once
 
 #include <optional>
+#include <variant>
 
 #include "mlx/utils.h"
 
@@ -10,7 +11,7 @@ namespace mlx::core::fast {
 
 array rms_norm(
     const array& x,
-    const array& weight,
+    const std::optional<array>& weight,
     float eps,
     StreamOrDevice s = {});
 
@@ -47,8 +48,8 @@ array scaled_dot_product_attention(
     const array& keys,
     const array& values,
     const float scale,
-    const std::optional<array>& mask = std::nullopt,
-    const std::optional<int> memory_efficient_threshold = std::nullopt,
+    const std::string& mask_mode = "",
+    const std::vector<array>& mask_arrs = {},
     StreamOrDevice s = {});
 
 std::tuple<array, array, array> affine_quantize(

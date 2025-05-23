@@ -18,6 +18,23 @@ void check_cpu_stream(const StreamOrDevice& s, const std::string& prefix) {
         "Explicitly pass a CPU stream to run it.");
   }
 }
+void check_float(Dtype dtype, const std::string& prefix) {
+  if (dtype != float32 && dtype != float64) {
+    std::ostringstream msg;
+    msg << prefix << " Arrays must have type float32 or float64. "
+        << "Received array with type " << dtype << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+void check_float_or_complex(Dtype dtype, const std::string& prefix) {
+  if (dtype != float32 && dtype != float64 && dtype != complex64) {
+    std::ostringstream msg;
+    msg << prefix << " Arrays must have type float32, float64 or complex64. "
+        << "Received array with type " << dtype << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
 
 Dtype at_least_float(const Dtype& d) {
   return issubdtype(d, inexact) ? d : promote_types(d, float32);
@@ -94,8 +111,21 @@ inline array matrix_norm(
         dtype,
         s);
   } else if (ord == 2.0 || ord == -2.0) {
-    throw std::runtime_error(
-        "[linalg::norm] Singular value norms are not implemented.");
+    row_axis = (axis[0] < 0) ? axis[0] + a.ndim() : axis[0];
+    col_axis = (axis[1] < 0) ? axis[1] + a.ndim() : axis[1];
+    auto a_matrix = (row_axis > col_axis)
+        ? moveaxis(moveaxis(a, row_axis, -1, s), col_axis, -1, s)
+        : moveaxis(moveaxis(a, col_axis, -1, s), row_axis, -2, s);
+    a_matrix = svd(a_matrix, false, s).at(0);
+    a_matrix = (ord == 2.0) ? max(a_matrix, -1, false, s)
+                            : min(a_matrix, -1, false, s);
+    if (keepdims) {
+      std::vector<int> sorted_axes = (row_axis < col_axis)
+          ? std::vector<int>{row_axis, col_axis}
+          : std::vector<int>{col_axis, row_axis};
+      a_matrix = expand_dims(a_matrix, sorted_axes, s);
+    }
+    return astype(a_matrix, dtype, s);
   } else {
     std::ostringstream msg;
     msg << "[linalg::norm] Invalid ord " << ord << " for matrix norm.";
@@ -112,8 +142,19 @@ inline array matrix_norm(
   if (ord == "f" || ord == "fro") {
     return l2_norm(a, axis, keepdims, s);
   } else if (ord == "nuc") {
-    throw std::runtime_error(
-        "[linalg::norm] Nuclear norm not yet implemented.");
+    int row_axis = (axis[0] < 0) ? axis[0] + a.ndim() : axis[0];
+    int col_axis = (axis[1] < 0) ? axis[1] + a.ndim() : axis[1];
+    auto a_matrix = (row_axis > col_axis)
+        ? moveaxis(moveaxis(a, row_axis, -1, s), col_axis, -1, s)
+        : moveaxis(moveaxis(a, col_axis, -1, s), row_axis, -2, s);
+    a_matrix = sum(svd(a_matrix, false, s).at(0), -1, false, s);
+    if (keepdims) {
+      std::vector<int> sorted_axes = (row_axis < col_axis)
+          ? std::vector<int>{row_axis, col_axis}
+          : std::vector<int>{col_axis, row_axis};
+      a_matrix = expand_dims(a_matrix, sorted_axes, s);
+    }
+    return a_matrix;
   } else {
     std::ostringstream msg;
     msg << "[linalg::norm] Invalid ord value '" << ord << "' for matrix norm.";
@@ -184,12 +225,8 @@ array norm(
 
 std::pair<array, array> qr(const array& a, StreamOrDevice s /* = {} */) {
   check_cpu_stream(s, "[linalg::qr]");
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::qr] Arrays must type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float(a.dtype(), "[linalg::qr]");
+
   if (a.ndim() < 2) {
     std::ostringstream msg;
     msg << "[linalg::qr] Arrays must have >= 2 dimensions. Received array "
@@ -210,14 +247,11 @@ std::pair<array, array> qr(const array& a, StreamOrDevice s /* = {} */) {
   return std::make_pair(out[0], out[1]);
 }
 
-std::vector<array> svd(const array& a, StreamOrDevice s /* = {} */) {
+std::vector<array>
+svd(const array& a, bool compute_uv, StreamOrDevice s /* = {} */) {
   check_cpu_stream(s, "[linalg::svd]");
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::svd] Input array must have type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float(a.dtype(), "[linalg::svd]");
+
   if (a.ndim() < 2) {
     std::ostringstream msg;
     msg << "[linalg::svd] Input array must have >= 2 dimensions. Received array "
@@ -230,13 +264,21 @@ std::vector<array> svd(const array& a, StreamOrDevice s /* = {} */) {
   const auto n = a.shape(-1);
   const auto rank = a.ndim();
 
-  auto u_shape = a.shape();
-  u_shape[rank - 2] = m;
-  u_shape[rank - 1] = m;
-
   auto s_shape = a.shape();
   s_shape.pop_back();
   s_shape[rank - 2] = std::min(m, n);
+
+  if (!compute_uv) {
+    return {array(
+        std::move(s_shape),
+        std::move(a.dtype()),
+        std::make_shared<SVD>(to_stream(s), compute_uv),
+        {a})};
+  }
+
+  auto u_shape = a.shape();
+  u_shape[rank - 2] = m;
+  u_shape[rank - 1] = m;
 
   auto vt_shape = a.shape();
   vt_shape[rank - 2] = n;
@@ -245,18 +287,14 @@ std::vector<array> svd(const array& a, StreamOrDevice s /* = {} */) {
   return array::make_arrays(
       {u_shape, s_shape, vt_shape},
       {a.dtype(), a.dtype(), a.dtype()},
-      std::make_shared<SVD>(to_stream(s)),
+      std::make_shared<SVD>(to_stream(s), compute_uv),
       {a});
 }
 
 array inv_impl(const array& a, bool tri, bool upper, StreamOrDevice s) {
   check_cpu_stream(s, "[linalg::inv]");
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::inv] Arrays must type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float(a.dtype(), "[linalg::inv]");
+
   if (a.ndim() < 2) {
     std::ostringstream msg;
     msg << "[linalg::inv] Arrays must have >= 2 dimensions. Received array "
@@ -282,7 +320,7 @@ array inv(const array& a, StreamOrDevice s /* = {} */) {
 
 array tri_inv(
     const array& a,
-    bool upper /* = true */,
+    bool upper /* = false */,
     StreamOrDevice s /* = {} */) {
   return inv_impl(a, /*tri=*/true, upper, s);
 }
@@ -292,13 +330,7 @@ array cholesky(
     bool upper /* = false */,
     StreamOrDevice s /* = {} */) {
   check_cpu_stream(s, "[linalg::cholesky]");
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::cholesky] Arrays must type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
-
+  check_float(a.dtype(), "[linalg::cholesky]");
   if (a.ndim() < 2) {
     std::ostringstream msg;
     msg << "[linalg::cholesky] Arrays must have >= 2 dimensions. Received array "
@@ -321,12 +353,8 @@ array cholesky(
 
 array pinv(const array& a, StreamOrDevice s /* = {} */) {
   check_cpu_stream(s, "[linalg::pinv]");
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::pinv] Arrays must type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float(a.dtype(), "[linalg::pinv]");
+
   if (a.ndim() < 2) {
     std::ostringstream msg;
     msg << "[linalg::pinv] Arrays must have >= 2 dimensions. Received array "
@@ -337,7 +365,7 @@ array pinv(const array& a, StreamOrDevice s /* = {} */) {
   int m = a.shape(-2);
   int n = a.shape(-1);
   int k = std::min(m, n);
-  auto outs = linalg::svd(a, s);
+  auto outs = linalg::svd(a, true, s);
   array U = outs[0];
   array S = outs[1];
   array V = outs[2];
@@ -360,7 +388,12 @@ array pinv(const array& a, StreamOrDevice s /* = {} */) {
   // Prepare S
   S = expand_dims(S, -2, s);
 
-  return matmul(divide(V, S, s), U);
+  auto rcond = 10. * std::max(m, n) * finfo(a.dtype()).eps;
+  auto cutoff = multiply(array(rcond, a.dtype()), max(S, -1, true, s), s);
+  auto rS =
+      where(greater(S, cutoff, s), reciprocal(S, s), array(0.0f, a.dtype()), s);
+
+  return matmul(multiply(V, rS, s), U, s);
 }
 
 array cholesky_inv(
@@ -368,12 +401,7 @@ array cholesky_inv(
     bool upper /* = false */,
     StreamOrDevice s /* = {} */) {
   check_cpu_stream(s, "[linalg::cholesky_inv]");
-  if (L.dtype() != float32) {
-    std::ostringstream msg;
-    msg << "[linalg::cholesky_inv] Arrays must type float32. Received array "
-        << "with type " << L.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float(L.dtype(), "[linalg::cholesky_inv]");
 
   if (L.ndim() < 2) {
     std::ostringstream msg;
@@ -469,17 +497,12 @@ array cross(
   return concatenate(outputs, axis, s);
 }
 
-void validate_eigh(
+void validate_eig(
     const array& a,
     const StreamOrDevice& stream,
     const std::string fname) {
   check_cpu_stream(stream, fname);
-  if (a.dtype() != float32) {
-    std::ostringstream msg;
-    msg << fname << " Arrays must have type float32. Received array "
-        << "with type " << a.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  check_float_or_complex(a.dtype(), fname);
 
   if (a.ndim() < 2) {
     std::ostringstream msg;
@@ -497,11 +520,12 @@ array eigvalsh(
     const array& a,
     std::string UPLO /* = "L" */,
     StreamOrDevice s /* = {} */) {
-  validate_eigh(a, s, "[linalg::eigvalsh]");
+  validate_eig(a, s, "[linalg::eigvalsh]");
   Shape out_shape(a.shape().begin(), a.shape().end() - 1);
+  Dtype eigval_type = a.dtype() == complex64 ? float32 : a.dtype();
   return array(
       std::move(out_shape),
-      a.dtype(),
+      eigval_type,
       std::make_shared<Eigh>(to_stream(s), UPLO, false),
       {a});
 }
@@ -510,13 +534,173 @@ std::pair<array, array> eigh(
     const array& a,
     std::string UPLO /* = "L" */,
     StreamOrDevice s /* = {} */) {
-  validate_eigh(a, s, "[linalg::eigh]");
+  validate_eig(a, s, "[linalg::eigh]");
+  Dtype eigval_type = a.dtype() == complex64 ? float32 : a.dtype();
   auto out = array::make_arrays(
       {Shape(a.shape().begin(), a.shape().end() - 1), a.shape()},
-      {a.dtype(), a.dtype()},
+      {eigval_type, a.dtype()},
       std::make_shared<Eigh>(to_stream(s), UPLO, true),
       {a});
   return std::make_pair(out[0], out[1]);
+}
+
+array eigvals(const array& a, StreamOrDevice s /* = {} */) {
+  validate_eig(a, s, "[linalg::eigvals]");
+  Shape out_shape(a.shape().begin(), a.shape().end() - 1);
+  return array(
+      std::move(out_shape),
+      complex64,
+      std::make_shared<Eig>(to_stream(s), false),
+      {a});
+}
+
+std::pair<array, array> eig(const array& a, StreamOrDevice s /* = {} */) {
+  validate_eig(a, s, "[linalg::eig]");
+  auto out = array::make_arrays(
+      {Shape(a.shape().begin(), a.shape().end() - 1), a.shape()},
+      {complex64, complex64},
+      std::make_shared<Eig>(to_stream(s), true),
+      {a});
+  return std::make_pair(out[0], out[1]);
+}
+
+void validate_lu(
+    const array& a,
+    const StreamOrDevice& stream,
+    const std::string& fname) {
+  check_cpu_stream(stream, fname);
+  check_float(a.dtype(), fname);
+
+  if (a.ndim() < 2) {
+    std::ostringstream msg;
+    msg << fname
+        << " Arrays must have >= 2 dimensions. Received array "
+           "with "
+        << a.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+std::vector<array> lu_helper(const array& a, StreamOrDevice s /* = {} */) {
+  int m = a.shape()[a.shape().size() - 2];
+  int n = a.shape()[a.shape().size() - 1];
+
+  Shape pivots_shape(a.shape().begin(), a.shape().end() - 2);
+  pivots_shape.push_back(std::min(m, n));
+
+  Shape row_idx_shape(a.shape().begin(), a.shape().end() - 1);
+
+  return array::make_arrays(
+      {a.shape(), pivots_shape, row_idx_shape},
+      {a.dtype(), uint32, uint32},
+      std::make_shared<LUF>(to_stream(s)),
+      {astype(a, a.dtype(), s)});
+}
+
+std::vector<array> lu(const array& a, StreamOrDevice s /* = {} */) {
+  validate_lu(a, s, "[linalg::lu]");
+
+  auto out = lu_helper(a, s);
+  auto& LU = out[0];
+  auto& row_pivots = out[2];
+  auto L = tril(LU, /* k = */ -1, s);
+  auto U = triu(LU, /* k = */ 0, s);
+
+  int M = a.shape(-2);
+  int N = a.shape(-1);
+  int K = std::min(M, N);
+  if (N != K) {
+    auto start = Shape(L.ndim(), 0);
+    auto stop = L.shape();
+    stop.back() = K;
+    L = slice(L, std::move(start), std::move(stop), s);
+  } else if (M != K) {
+    auto start = Shape(U.ndim(), 0);
+    auto stop = U.shape();
+    stop[U.ndim() - 2] = K;
+    U = slice(U, std::move(start), std::move(stop), s);
+  }
+  L = add(L, eye(M, K, s), s);
+  return {row_pivots, L, U};
+}
+
+std::pair<array, array> lu_factor(const array& a, StreamOrDevice s /* = {} */) {
+  validate_lu(a, s, "[linalg::lu_factor]");
+  auto out = lu_helper(a, s);
+  return std::make_pair(out[0], out[1]);
+}
+
+void validate_solve(
+    const array& a,
+    const array& b,
+    const StreamOrDevice& stream,
+    const std::string& fname) {
+  check_cpu_stream(stream, fname);
+  if (a.ndim() < 2) {
+    std::ostringstream msg;
+    msg << fname << " First input must have >= 2 dimensions. "
+        << "Received array with " << a.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (b.ndim() < 1) {
+    std::ostringstream msg;
+    msg << fname << " Second input must have >= 1 dimensions. "
+        << "Received array with " << b.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (a.shape(-1) != a.shape(-2)) {
+    std::ostringstream msg;
+    msg << fname << " First input must be a square matrix. "
+        << "Received array with shape " << a.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int lastDim = b.ndim() > 1 ? -2 : -1;
+  if (a.shape(-1) != b.shape(lastDim)) {
+    std::ostringstream msg;
+    msg << fname << " Last dimension of first input with shape " << a.shape()
+        << " must match second to last dimension of"
+        << " second input with shape " << b.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto out_type = promote_types(a.dtype(), b.dtype());
+  if (out_type != float32 && out_type != float64) {
+    std::ostringstream msg;
+    msg << fname
+        << " Input arrays must promote to float32 or float64. "
+           " Received arrays with type "
+        << a.dtype() << " and " << b.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+array solve(const array& a, const array& b, StreamOrDevice s /* = {} */) {
+  validate_solve(a, b, s, "[linalg::solve]");
+
+  // P, L, U matrices
+  const auto luf = lu(a, s);
+  auto perm = argsort(luf[0], -1, s);
+  int take_axis = -1;
+  if (b.ndim() >= 2) {
+    perm = expand_dims(perm, -1, s);
+    take_axis -= 1;
+  }
+  auto pb = take_along_axis(b, perm, take_axis);
+  auto y = solve_triangular(luf[1], pb, /* upper = */ false, s);
+  return solve_triangular(luf[2], y, /* upper = */ true, s);
+}
+
+array solve_triangular(
+    const array& a,
+    const array& b,
+    bool upper /* = false */,
+    StreamOrDevice s /* = {} */) {
+  validate_solve(a, b, s, "[linalg::solve_triangular]");
+  auto a_inv = tri_inv(a, upper, s);
+  return matmul(a_inv, b, s);
 }
 
 } // namespace mlx::core::linalg

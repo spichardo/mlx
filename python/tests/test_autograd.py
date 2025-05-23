@@ -1,5 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
+import gc
 import unittest
 
 import mlx.core as mx
@@ -699,6 +700,102 @@ class TestAutograd(mlx_tests.MLXTestCase):
         _, (jout,) = mx.jvp(fun, (a,), (tan_a,))
         expected = mx.array([0.0, 2.0, 2.0, 0.0, 2.0])[:, None]
         self.assertTrue(mx.allclose(expected, jout))
+
+    def test_slice_grads(self):
+        # Slice
+        def fun(a):
+            return a[5:-6:-1]
+
+        a = mx.ones(shape=(5,))
+        cotan = mx.random.uniform(shape=(5,))
+        _, (grad,) = mx.vjp(fun, (a,), (cotan,))
+        self.assertTrue(mx.allclose(grad, cotan[::-1]))
+
+        tan = mx.random.uniform(shape=(5,))
+        mx.eval(tan)
+        _, (grad,) = mx.jvp(fun, (a,), (tan,))
+        self.assertTrue(mx.allclose(grad, tan[::-1]))
+
+        # Slice update
+        def fun(a, b):
+            a[4:-5:-2] = b
+            return a
+
+        a = mx.ones(shape=(4,))
+        b = mx.zeros(shape=(2,))
+
+        cotan = mx.random.uniform(shape=(4,))
+        _, (grad_a, grad_b) = mx.vjp(fun, (a, b), (cotan,))
+        expected_a = mx.array(cotan)
+        expected_a[1::2] = 0.0
+        self.assertTrue(mx.allclose(grad_a, expected_a))
+        self.assertTrue(mx.allclose(grad_b, cotan[4:-5:-2]))
+
+        tan_a = mx.random.uniform(shape=(4,))
+        tan_b = mx.random.uniform(shape=(2,))
+        _, (grad,) = mx.jvp(fun, (a, b), (tan_a, tan_b))
+        expected = tan_a
+        expected[4:-5:-2] = tan_b
+        self.assertTrue(mx.allclose(grad, expected))
+
+    def test_leaks(self):
+        for transform in [
+            mx.grad,
+            mx.value_and_grad,
+            mx.custom_function,
+            mx.checkpoint,
+        ]:
+            mx.synchronize()
+            mem_pre = mx.get_active_memory()
+
+            def outer():
+                d = {}
+
+                def f(x):
+                    return d["x"]
+
+                d["f"] = transform(f)
+                d["x"] = mx.array([0] * 1000)
+
+            for _ in range(5):
+                outer()
+                gc.collect()
+            mem_post = mx.get_active_memory()
+            self.assertEqual(mem_pre, mem_post)
+
+    def test_grad_with_copies(self):
+        a = mx.array(2.0)
+        arrays = [a, a, a]
+
+        def fun(arrays):
+            return arrays[0] + arrays[2]
+
+        grads = mx.grad(fun)(arrays)
+        self.assertEqual(grads[0].item(), 1.0)
+        self.assertEqual(grads[2].item(), 1.0)
+
+    def test_grad_ids_pre_post(self):
+        def fun(arrs):
+            return arrs[0]
+
+        arrs = [mx.array(1.0)]
+        init_id = id(arrs[0])
+        mx.grad(fun)(arrs)
+        self.assertEqual(init_id, id(arrs[0]))
+
+    def test_grad_with_inplace_update(self):
+        def loss_fn(model):
+            model[1] = mx.array(2.0)
+            return model[0]
+
+        model = [
+            mx.array(0.0),
+            mx.array(1.0),
+        ]
+
+        grad_fn = mx.grad(loss_fn)
+        grad_fn(model)
+        self.assertEqual(model[1].item(), 2.0)
 
 
 if __name__ == "__main__":

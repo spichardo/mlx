@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 
+#include "mlx/dtype_utils.h"
 #include "mlx/types/limits.h"
 #include "mlx/utils.h"
 
@@ -13,6 +14,16 @@ namespace mlx::core {
 Stream to_stream(StreamOrDevice s) {
   if (std::holds_alternative<std::monostate>(s)) {
     return default_stream(default_device());
+  } else if (std::holds_alternative<Device>(s)) {
+    return default_stream(std::get<Device>(s));
+  } else {
+    return std::get<Stream>(s);
+  }
+}
+
+Stream to_stream(StreamOrDevice s, Device default_) {
+  if (std::holds_alternative<std::monostate>(s)) {
+    return default_stream(default_);
   } else if (std::holds_alternative<Device>(s)) {
     return default_stream(std::get<Device>(s));
   } else {
@@ -52,6 +63,9 @@ inline void PrintFormatter::print(std::ostream& os, bfloat16_t val) {
   os << val;
 }
 inline void PrintFormatter::print(std::ostream& os, float val) {
+  os << val;
+}
+inline void PrintFormatter::print(std::ostream& os, double val) {
   os << val;
 }
 inline void PrintFormatter::print(std::ostream& os, complex64_t val) {
@@ -211,35 +225,7 @@ void print_array(std::ostream& os, const array& a) {
 } // namespace
 
 std::ostream& operator<<(std::ostream& os, const Dtype& dtype) {
-  switch (dtype) {
-    case bool_:
-      return os << "bool";
-    case uint8:
-      return os << "uint8";
-    case uint16:
-      return os << "uint16";
-    case uint32:
-      return os << "uint32";
-    case uint64:
-      return os << "uint64";
-    case int8:
-      return os << "int8";
-    case int16:
-      return os << "int16";
-    case int32:
-      return os << "int32";
-    case int64:
-      return os << "int64";
-    case float16:
-      return os << "float16";
-    case float32:
-      return os << "float32";
-    case bfloat16:
-      return os << "bfloat16";
-    case complex64:
-      return os << "complex64";
-  }
-  return os;
+  return os << dtype_to_string(dtype);
 }
 
 std::ostream& operator<<(std::ostream& os, const Dtype::Kind& k) {
@@ -262,47 +248,7 @@ std::ostream& operator<<(std::ostream& os, const Dtype::Kind& k) {
 
 std::ostream& operator<<(std::ostream& os, array a) {
   a.eval();
-  switch (a.dtype()) {
-    case bool_:
-      print_array<bool>(os, a);
-      break;
-    case uint8:
-      print_array<uint8_t>(os, a);
-      break;
-    case uint16:
-      print_array<uint16_t>(os, a);
-      break;
-    case uint32:
-      print_array<uint32_t>(os, a);
-      break;
-    case uint64:
-      print_array<uint64_t>(os, a);
-      break;
-    case int8:
-      print_array<int8_t>(os, a);
-      break;
-    case int16:
-      print_array<int16_t>(os, a);
-      break;
-    case int32:
-      print_array<int32_t>(os, a);
-      break;
-    case int64:
-      print_array<int64_t>(os, a);
-      break;
-    case float16:
-      print_array<float16_t>(os, a);
-      break;
-    case bfloat16:
-      print_array<bfloat16_t>(os, a);
-      break;
-    case float32:
-      print_array<float>(os, a);
-      break;
-    case complex64:
-      print_array<complex64_t>(os, a);
-      break;
-  }
+  MLX_SWITCH_ALL_TYPES(a.dtype(), CTYPE, print_array<CTYPE>(os, a));
   return os;
 }
 
@@ -337,9 +283,10 @@ int get_var(const char* name, int default_value) {
 } // namespace env
 
 template <typename T>
-void set_finfo_limits(float& min, float& max) {
+void set_finfo_limits(double& min, double& max, double& eps) {
   min = numeric_limits<T>::lowest();
   max = numeric_limits<T>::max();
+  eps = numeric_limits<T>::epsilon();
 }
 
 finfo::finfo(Dtype dtype) : dtype(dtype) {
@@ -349,15 +296,28 @@ finfo::finfo(Dtype dtype) : dtype(dtype) {
     throw std::invalid_argument(msg.str());
   }
   if (dtype == float32) {
-    set_finfo_limits<float>(min, max);
+    set_finfo_limits<float>(min, max, eps);
   } else if (dtype == float16) {
-    set_finfo_limits<float16_t>(min, max);
+    set_finfo_limits<float16_t>(min, max, eps);
   } else if (dtype == bfloat16) {
-    set_finfo_limits<bfloat16_t>(min, max);
+    set_finfo_limits<bfloat16_t>(min, max, eps);
+  } else if (dtype == float64) {
+    set_finfo_limits<double>(min, max, eps);
   } else if (dtype == complex64) {
     this->dtype = float32;
-    set_finfo_limits<float>(min, max);
+    set_finfo_limits<float>(min, max, eps);
   }
+}
+
+template <typename T>
+void set_iinfo_limits(int64_t& min, uint64_t& max) {
+  min = std::numeric_limits<T>::min();
+  max = std::numeric_limits<T>::max();
+}
+
+iinfo::iinfo(Dtype dtype) : dtype(dtype) {
+  MLX_SWITCH_INT_TYPES_CHECKED(
+      dtype, "[iinfo]", CTYPE, set_iinfo_limits<CTYPE>(min, max));
 }
 
 } // namespace mlx::core

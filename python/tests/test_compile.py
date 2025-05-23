@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import gc
 import io
 import unittest
 from functools import partial
@@ -814,6 +815,31 @@ class TestCompile(mlx_tests.MLXTestCase):
         out = fun(*inputs)
         self.assertTrue(mx.allclose(out, mx.full((2, 2), 20)))
 
+        @mx.compile
+        def fun(arrs):
+            for _ in range(6):
+                arrs = [x + y for x, y in zip(arrs[::2], arrs[1::2])]
+            return arrs[0]
+
+        arrs = [mx.array([1.0, 2.0]) for _ in range(64)]
+        out = fun(arrs)
+        self.assertTrue(mx.allclose(out, mx.array([64.0, 128.0])))
+
+    def test_compile_many_outputs(self):
+
+        @mx.compile
+        def fun(arr):
+            arrs = [arr] * 64
+            first_arrs = None
+            for _ in range(6):
+                arrs = [x + y for x, y in zip(arrs[::2], arrs[1::2])]
+                if first_arrs is None:
+                    first_arrs = arrs
+            return arrs[0], first_arrs
+
+        out = fun(mx.array([1.0, 2.0]))
+        self.assertTrue(mx.allclose(out[0], mx.array([64.0, 128.0])))
+
     def test_shapeless_compile_matmul(self):
         a = mx.array([0.0, 1.0, 2.0])
         b = mx.array([0.0, 1.0, 2.0])
@@ -925,6 +951,33 @@ class TestCompile(mlx_tests.MLXTestCase):
 
         self.assertEqual(out[0].shape, (3, 1, 4, 2))
         self.assertEqual(out[1].shape, (2, 2, 5))
+
+    def test_leaks(self):
+        gc.collect()
+        if mx.metal.is_available():
+            mem_pre = mx.get_active_memory()
+        else:
+            mem_pre = 0
+
+        def outer():
+            d = {}
+
+            def f(x):
+                return d["x"]
+
+            d["f"] = mx.compile(f)
+            d["x"] = mx.array([0] * 1000)
+
+        for _ in range(5):
+            outer()
+            gc.collect()
+
+        if mx.metal.is_available():
+            mem_post = mx.get_active_memory()
+        else:
+            mem_post = 0
+
+        self.assertEqual(mem_pre, mem_post)
 
 
 if __name__ == "__main__":

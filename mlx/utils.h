@@ -14,6 +14,7 @@ namespace mlx::core {
 
 using StreamOrDevice = std::variant<std::monostate, Stream, Device>;
 Stream to_stream(StreamOrDevice s);
+Stream to_stream(StreamOrDevice s, Device default_);
 
 struct StreamContext {
  public:
@@ -47,6 +48,7 @@ struct PrintFormatter {
   inline void print(std::ostream& os, float16_t val);
   inline void print(std::ostream& os, bfloat16_t val);
   inline void print(std::ostream& os, float val);
+  inline void print(std::ostream& os, double val);
   inline void print(std::ostream& os, complex64_t val);
 
   bool capitalize_bool{false};
@@ -61,8 +63,17 @@ void abort_with_exception(const std::exception& error);
 struct finfo {
   explicit finfo(Dtype dtype);
   Dtype dtype;
-  float min;
-  float max;
+  double min;
+  double max;
+  double eps;
+};
+
+/** Holds information about integral types. */
+struct iinfo {
+  explicit iinfo(Dtype dtype);
+  Dtype dtype;
+  int64_t min;
+  uint64_t max;
 };
 
 /** The type from promoting the arrays' types with one another. */
@@ -121,9 +132,16 @@ inline int bfs_max_width() {
   return bfs_max_width_;
 }
 
-inline int max_ops_per_buffer() {
-  static int max_ops_per_buffer_ = get_var("MLX_MAX_OPS_PER_BUFFER", 10);
+inline int max_ops_per_buffer(int default_value) {
+  static int max_ops_per_buffer_ =
+      get_var("MLX_MAX_OPS_PER_BUFFER", default_value);
   return max_ops_per_buffer_;
+}
+
+inline int max_mb_per_buffer(int default_value) {
+  static int max_mb_per_buffer_ =
+      get_var("MLX_MAX_MB_PER_BUFFER", default_value);
+  return max_mb_per_buffer_;
 }
 
 inline bool metal_fast_synch() {

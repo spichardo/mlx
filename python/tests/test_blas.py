@@ -12,7 +12,7 @@ import numpy as np
 class TestBlas(mlx_tests.MLXTestCase):
     @property
     def dtypes(self):
-        return ["float32", "float16"] if mx.metal.is_available() else ["float32"]
+        return ["float32", "float16"]
 
     def __gemm_test(
         self,
@@ -589,6 +589,10 @@ class TestBlas(mlx_tests.MLXTestCase):
         alpha = 0.5
         beta = 2.0
 
+        # c must broadcast to the output shape
+        with self.assertRaises(ValueError):
+            mx.addmm(mx.zeros((2, 2, 2)), mx.zeros((2, 2)), mx.zeros((2, 2)))
+
         # Regular batched case
         a_npy = np.random.normal(0.0, 1.0 / 128, (32, 128, 16)).astype(np.float32)
         b_npy = np.random.normal(0.0, 1.0 / 128, (32, 16, 16)).astype(np.float32)
@@ -744,6 +748,19 @@ class TestBlas(mlx_tests.MLXTestCase):
         c = a @ b
         mx.eval(c)
         self.assertEqual(c.shape, (0, 0))
+
+        c = mx.array(1.0, dtype=mx.float32)
+        a = mx.array([], dtype=mx.float32)
+        b = mx.array([], dtype=mx.float32)
+        out = mx.addmm(c, a, b)
+        self.assertEqual(out.item(), 1.0)
+        self.assertEqual(out.shape, ())
+
+        a = mx.zeros(shape=(5, 0))
+        b = mx.zeros(shape=(0, 5))
+        c = mx.random.uniform(shape=(5, 5))
+        out = mx.addmm(c, a, b)
+        self.assertTrue(mx.allclose(out, c))
 
     def test_block_masked_matmul(self):
         def ref_block_masked_mm(
@@ -1108,7 +1125,7 @@ class TestBlas(mlx_tests.MLXTestCase):
             lhs_indices_ = mx.broadcast_to(lhs_indices, (3, 2))
             rhs_indices_ = mx.broadcast_to(rhs_indices, (3, 2))
             M = a.shape[-2]
-            N = b.shape[-2]
+            N = b.shape[-1]
             K = a.shape[-1]
 
             a = a.reshape((-1, M, K))
@@ -1145,6 +1162,67 @@ class TestBlas(mlx_tests.MLXTestCase):
         for r, t in zip(dout_ref, dout_test):
             self.assertEqual(r.shape, t.shape)
             self.assertTrue(mx.allclose(r, t, atol=1e-4).item())
+
+    def test_gemv_gemm_same_precision(self):
+        mx.random.seed(0)
+        N = 256
+        if mx.metal.is_available():
+            t = mx.bfloat16
+            a = mx.random.normal([1, N]).astype(t)
+            b = mx.concatenate([a, a], axis=0).astype(t)
+            c = mx.random.normal([N, 64]).astype(t)
+            out_gemv = a @ c
+            out_gemm = (b @ c)[0]
+            self.assertTrue(mx.allclose(out_gemv, out_gemm))
+
+    def test_complex_gemv(self):
+        M = 16
+        N = 50
+
+        def rand(shape):
+            return mx.random.uniform(shape=shape) + 1j * mx.random.uniform(shape=shape)
+
+        a = rand((M, N))
+        b = rand((N, 1))
+        c = mx.matmul(a, b)
+        c_np = np.matmul(a, b)
+        self.assertTrue(np.allclose(c, c_np))
+
+        # Transposed
+        a = rand((N, M))
+        b = rand((N, 1))
+        c = mx.matmul(a.T, b)
+        c_np = np.matmul(np.array(a).T, b)
+        self.assertTrue(np.allclose(c, c_np))
+
+    def test_complex_gemm(self):
+        M = 16
+        K = 50
+        N = 32
+
+        def rand(shape):
+            return mx.random.uniform(shape=shape) + 1j * mx.random.uniform(shape=shape)
+
+        a = rand((M, K))
+        b = rand((K, N))
+        c = mx.matmul(a, b)
+        c_np = np.matmul(a, b)
+        self.assertTrue(np.allclose(c, c_np))
+
+        # Test addmm
+        M = 16
+        K = 50
+        N = 32
+
+        def rand(shape):
+            return mx.random.uniform(shape=shape) + 1j * mx.random.uniform(shape=shape)
+
+        a = rand((M, K))
+        b = rand((K, N))
+        c = rand((M, N))
+        out = mx.addmm(c, a, b, 2.0, 2.0)
+        out_np = 2.0 * np.matmul(a, b) + 2.0 * c
+        self.assertTrue(np.allclose(out, out_np))
 
 
 if __name__ == "__main__":

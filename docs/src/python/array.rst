@@ -19,6 +19,8 @@ Array
     array.ndim
     array.shape
     array.size
+    array.real
+    array.imag
     array.abs
     array.all
     array.any
@@ -38,6 +40,7 @@ Array
     array.log10
     array.log1p
     array.log2
+    array.logcumsumexp
     array.logsumexp
     array.max
     array.mean

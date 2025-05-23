@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/primitives.h"
+#include "mlx/distributed/primitives.h"
 #include "mlx/fast_primitives.h"
 
 #define NO_CPU_MULTI(func)                                             \
@@ -33,6 +34,7 @@ NO_CPU(ArgSort)
 NO_CPU(AsType)
 NO_CPU(AsStrided)
 NO_CPU(BitwiseBinary)
+NO_CPU(BitwiseInvert)
 NO_CPU(BlockMaskedMM)
 NO_CPU(Broadcast)
 NO_CPU(BroadcastAxes)
@@ -53,6 +55,7 @@ NO_CPU(DynamicSlice)
 NO_CPU(DynamicSliceUpdate)
 NO_CPU(NumberOfElements)
 NO_CPU(Remainder)
+NO_CPU_MULTI(Eig)
 NO_CPU_MULTI(Eigh)
 NO_CPU(Equal)
 NO_CPU(Erf)
@@ -74,13 +77,14 @@ NO_CPU(Hadamard)
 NO_CPU(Imag)
 NO_CPU(Less)
 NO_CPU(LessEqual)
-NO_CPU(Load)
 NO_CPU(Log)
 NO_CPU(Log1p)
 NO_CPU(LogicalNot)
 NO_CPU(LogicalAnd)
 NO_CPU(LogicalOr)
 NO_CPU(LogAddExp)
+NO_CPU(LogSumExp)
+NO_CPU_MULTI(LUF)
 NO_CPU(Matmul)
 NO_CPU(Maximum)
 NO_CPU(Minimum)
@@ -126,5 +130,12 @@ NO_CPU(View)
 namespace fast {
 NO_CPU_MULTI(AffineQuantize)
 } // namespace fast
+
+namespace distributed {
+NO_CPU_MULTI(AllReduce)
+NO_CPU_MULTI(AllGather)
+NO_CPU_MULTI(Send)
+NO_CPU_MULTI(Recv)
+} // namespace distributed
 
 } // namespace mlx::core

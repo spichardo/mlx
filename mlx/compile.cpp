@@ -15,6 +15,7 @@
 namespace mlx::core {
 
 constexpr int max_compile_depth = 11;
+constexpr int max_compile_arrays = 24;
 
 bool is_unary(const Primitive& p) {
   return (
@@ -34,7 +35,7 @@ bool is_unary(const Primitive& p) {
       typeid(p) == typeid(Square) || typeid(p) == typeid(Sqrt) ||
       typeid(p) == typeid(Tan) || typeid(p) == typeid(Tanh) ||
       typeid(p) == typeid(Expm1) || typeid(p) == typeid(Real) ||
-      typeid(p) == typeid(Imag));
+      typeid(p) == typeid(Imag) || typeid(p) == typeid(BitwiseInvert));
 }
 
 bool is_binary(const Primitive& p) {
@@ -166,6 +167,15 @@ void merge_one(array& dst, array& src, ParentsMap& parents_map) {
   for (auto& parent : src_parents->second) {
     parent.first.inputs()[parent.second] = dst;
     pairs.push_back(parent);
+  }
+
+  // If src is a parent of dst, remove it from dst's parents
+  for (auto it = pairs.begin(); it != pairs.end();) {
+    if (it->first.id() == src.id()) {
+      it = pairs.erase(it);
+    } else {
+      it++;
+    }
   }
   // Remove the source from the map to avoid fusing with it again
   parents_map.erase(src_parents);
@@ -570,6 +580,7 @@ void compile_fuse(
 
     std::function<void(const array&, int, const Stream&, const Shape&)> recurse;
     std::unordered_set<uintptr_t> cache;
+    std::unordered_set<uintptr_t> input_set;
     recurse = [&](const array& a,
                   int depth,
                   const Stream& s,
@@ -587,6 +598,8 @@ void compile_fuse(
       if (depth >= max_compile_depth || !a.has_primitive() ||
           a.primitive().stream() != s || !is_fusable(a.primitive()) ||
           (output_map.find(a.id()) != output_map.end() && a.shape() != shape)) {
+        // Possible input
+        input_set.insert(a.id());
         return;
       }
 
@@ -607,9 +620,20 @@ void compile_fuse(
       // Arrays with a mix of parents outside the compilable section
       // are not fusable
       if (!all_parents_in) {
+        // Possible input
+        input_set.insert(a.id());
         return;
       }
 
+      if (output_map.find(a.id()) != output_map.end()) {
+        input_set.insert(a.id());
+      } else {
+        // Not an input anymore since fusing it
+        input_set.erase(a.id());
+      }
+      if (input_set.size() >= max_compile_arrays) {
+        return;
+      }
       cache.insert({a.id()});
 
       for (auto& in : a.inputs()) {
@@ -630,7 +654,7 @@ void compile_fuse(
 
     // Recurse a second time to build the tape in the right
     // order and collect the inputs
-    std::unordered_set<uintptr_t> input_set;
+    input_set.clear();
     std::vector<array> inputs;
     std::vector<array> fused_tape;
     std::unordered_set<uintptr_t> tape_set;
@@ -922,7 +946,7 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
 }
 
 std::function<std::vector<array>(const std::vector<array>&)> compile(
-    std::vector<array>(fun)(const std::vector<array>&),
+    std::vector<array> (*fun)(const std::vector<array>&),
     bool shapeless /* = false */) {
   if (detail::skip_compile()) {
     return fun;

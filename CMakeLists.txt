@@ -1,6 +1,24 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(mlx LANGUAGES C CXX)
+if(NOT MLX_VERSION)
+  file(STRINGS "mlx/version.h" _mlx_h_version REGEX "^#define MLX_VERSION_.*$")
+  string(REGEX MATCH "#define MLX_VERSION_MAJOR ([0-9]+)" _ "${_mlx_h_version}")
+  set(_major ${CMAKE_MATCH_1})
+  string(REGEX MATCH "#define MLX_VERSION_MINOR ([0-9]+)" _ "${_mlx_h_version}")
+  set(_minor ${CMAKE_MATCH_1})
+  string(REGEX MATCH "#define MLX_VERSION_PATCH ([0-9]+)" _ "${_mlx_h_version}")
+  set(_patch ${CMAKE_MATCH_1})
+  set(MLX_PROJECT_VERSION "${_major}.${_minor}.${_patch}")
+  set(MLX_VERSION ${MLX_PROJECT_VERSION})
+else()
+  string(REGEX REPLACE "^([0-9]+\.[0-9]+\.[0-9]+).*" "\\1" MLX_PROJECT_VERSION
+                       ${MLX_VERSION})
+endif()
+
+project(
+  mlx
+  LANGUAGES C CXX
+  VERSION ${MLX_PROJECT_VERSION})
 
 # ----------------------------- Setup -----------------------------
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
@@ -16,6 +34,7 @@ option(MLX_BUILD_BENCHMARKS "Build benchmarks for mlx" OFF)
 option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
 option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
+option(MLX_BUILD_CUDA "Build cuda backend" OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
@@ -24,13 +43,7 @@ option(MLX_BUILD_BLAS_FROM_SOURCE "Build OpenBLAS from source code" OFF)
 option(MLX_METAL_JIT "Use JIT compilation for Metal kernels" OFF)
 option(BUILD_SHARED_LIBS "Build mlx as a shared library" OFF)
 
-if(NOT MLX_VERSION)
-  set(MLX_VERSION 0.22.0)
-endif()
-add_compile_definitions("MLX_VERSION=${MLX_VERSION}")
-
 # --------------------- Processor tests -------------------------
-
 message(
   STATUS
     "Building MLX for ${CMAKE_SYSTEM_PROCESSOR} processor on ${CMAKE_SYSTEM_NAME}"
@@ -69,6 +82,10 @@ if(MLX_BUILD_METAL)
   set(METAL_LIB "-framework Metal")
   set(FOUNDATION_LIB "-framework Foundation")
   set(QUARTZ_LIB "-framework QuartzCore")
+endif()
+
+if(MLX_BUILD_CUDA)
+  enable_language(CUDA)
 endif()
 
 if(MLX_BUILD_METAL AND NOT METAL_LIB)
@@ -200,23 +217,13 @@ else()
   set(MLX_BUILD_ACCELERATE OFF)
 endif()
 
-find_package(MPI)
-if(MPI_FOUND)
-  execute_process(
-    COMMAND zsh "-c" "mpirun --version"
-    OUTPUT_VARIABLE MPI_VERSION
-    ERROR_QUIET)
-  if(${MPI_VERSION} MATCHES ".*Open MPI.*")
-    target_include_directories(mlx PRIVATE ${MPI_INCLUDE_PATH})
-  elseif(MPI_VERSION STREQUAL "")
-    set(MPI_FOUND FALSE)
-    message(
-      WARNING "MPI found but mpirun is not available. Building without MPI.")
-  else()
-    set(MPI_FOUND FALSE)
-    message(WARNING "MPI which is not OpenMPI found. Building without MPI.")
-  endif()
-endif()
+message(STATUS "Downloading json")
+FetchContent_Declare(
+  json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+FetchContent_MakeAvailable(json)
+target_include_directories(
+  mlx PRIVATE $<BUILD_INTERFACE:${json_SOURCE_DIR}/single_include/nlohmann>)
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/mlx)
 

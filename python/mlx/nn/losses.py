@@ -1,7 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, get_args
 
 import mlx.core as mx
 
@@ -9,14 +9,15 @@ Reduction = Literal["none", "mean", "sum"]
 
 
 def _reduce(loss: mx.array, reduction: Reduction = "none"):
+    if reduction not in get_args(Reduction):
+        raise ValueError(f"Invalid reduction. Must be one of {get_args(Reduction)}.")
+
     if reduction == "mean":
         return mx.mean(loss)
     elif reduction == "sum":
         return mx.sum(loss)
     elif reduction == "none":
         return loss
-    else:
-        raise ValueError("Invalid reduction. Must be 'none', 'mean', or 'sum'.")
 
 
 def cross_entropy(
@@ -351,7 +352,7 @@ def smooth_l1_loss(
     .. math::
 
       l = \begin{cases}
-            0.5 (x - y)^2, & \text{if } (x - y) < \beta \\
+            0.5 (x - y)^2 / \beta, & \text{if } |x - y| < \beta \\
             |x - y| - 0.5 \beta, & \text{otherwise}
           \end{cases}
 
@@ -372,7 +373,7 @@ def smooth_l1_loss(
             f"targets shape {targets.shape}."
         )
 
-    diff = predictions - targets
+    diff = mx.abs(predictions - targets)
     loss = mx.where(
         diff < beta, 0.5 * mx.square(diff) / beta, mx.abs(diff) - 0.5 * beta
     )

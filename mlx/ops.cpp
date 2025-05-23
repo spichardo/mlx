@@ -230,16 +230,16 @@ array linspace(
     throw std::invalid_argument(msg.str());
   }
   if (num == 1) {
-    return astype(array({start}), dtype, to_stream(s));
+    return astype(array({start}), dtype, s);
   }
-  array sequence = arange(0, num, float32, to_stream(s));
-  float step = (stop - start) / (num - 1);
+  array t = divide(arange(0, num, float32, s), array(num - 1, float32), s);
+  array t_bar = subtract(array(1, float32), t, s);
   return astype(
-      add(multiply(sequence, array(step), to_stream(s)),
-          array(start),
-          to_stream(s)),
+      add(multiply(t_bar, array(start, float32), s),
+          multiply(t, array(stop, float32), s),
+          s),
       dtype,
-      to_stream(s));
+      s);
 }
 
 array astype(array a, Dtype dtype, StreamOrDevice s /* = {} */) {
@@ -472,9 +472,24 @@ array hadamard_transform(
     const array& a,
     std::optional<float> scale_ /* = std::nullopt */,
     StreamOrDevice s /* = {} */) {
+  if (a.size() == 0) {
+    throw std::invalid_argument(
+        "[hadamard_transform] Does not support empty arrays.");
+  }
   // Default to an orthonormal Hadamard matrix scaled by 1/sqrt(N)
-  float scale = scale_.has_value() ? *scale_ : 1.0f / std::sqrt(a.shape(-1));
+  int n = a.ndim() > 0 ? a.shape(-1) : 1;
+  float scale = scale_.has_value() ? *scale_ : 1.0f / std::sqrt(n);
   auto dtype = issubdtype(a.dtype(), floating) ? a.dtype() : float32;
+
+  // Nothing to do for a scalar
+  if (n == 1) {
+    if (scale == 1) {
+      return a;
+    }
+
+    return multiply(a, array(scale, dtype), s);
+  }
+
   return array(
       a.shape(),
       dtype,
@@ -599,7 +614,13 @@ array expand_dims(
 namespace {
 
 inline auto
-normalize_slice(const Shape& shape, Shape& start, Shape& stop, Shape& strides) {
+normalize_slice(const Shape& shape, Shape& start, Shape stop, Shape& strides) {
+  // - Start indices are normalized
+  // - End indices are unchanged as -1 means something different
+  //   pre-normalization (the end of the axis) versus post normalization (the
+  //   position left of 0).
+  // - Any strides corresponding to singleton dimension are set to 1
+
   Shape out_shape(shape.size());
   bool has_neg_strides = false;
 
@@ -624,10 +645,10 @@ normalize_slice(const Shape& shape, Shape& start, Shape& stop, Shape& strides) {
       auto ed = e > -1 ? e : -1;
 
       start[i] = st;
-      stop[i] = ed > st ? st : ed;
+      ed = ed > st ? st : ed;
 
       auto str = -strides[i];
-      out_shape[i] = (start[i] - stop[i] + str - 1) / str;
+      out_shape[i] = (start[i] - ed + str - 1) / str;
 
     } else {
       // Clamp to bounds
@@ -635,9 +656,9 @@ normalize_slice(const Shape& shape, Shape& start, Shape& stop, Shape& strides) {
       auto ed = std::max(static_cast<ShapeElem>(0), std::min(e, n));
 
       start[i] = st;
-      stop[i] = ed < st ? st : ed;
+      ed = ed < st ? st : ed;
 
-      out_shape[i] = (stop[i] - start[i] + strides[i] - 1) / strides[i];
+      out_shape[i] = (ed - start[i] + strides[i] - 1) / strides[i];
     }
     // Simplify the stride if it's unused
     if (out_shape[i] == 1) {
@@ -986,6 +1007,9 @@ array concatenate(
   if (arrays.size() == 0) {
     throw std::invalid_argument(
         "[concatenate] No arrays provided for concatenation");
+  }
+  if (arrays.size() == 1) {
+    return arrays[0];
   }
 
   auto ax = normalize_axis_index(axis, arrays[0].ndim(), "[concatenate] ");
@@ -2350,6 +2374,29 @@ array logsumexp(
     const std::vector<int>& axes,
     bool keepdims /* = false */,
     StreamOrDevice s /* = {}*/) {
+  if (a.size() == 0) {
+    throw std::invalid_argument("[logsumexp] Received empty array.");
+  }
+  if (a.ndim() == 0 && !axes.empty()) {
+    throw std::invalid_argument(
+        "[logsumexp] Received non-empty axes for array with 0 dimensions.");
+  }
+  bool is_complex = issubdtype(a.dtype(), complexfloating);
+  if (!is_complex && axes.size() == 1 &&
+      (a.ndim() == axes[0] + 1 || axes[0] == -1)) {
+    auto dtype = at_least_float(a.dtype());
+    auto out_shape = a.shape();
+    out_shape.back() = 1;
+    auto out = array(
+        std::move(out_shape),
+        dtype,
+        std::make_shared<LogSumExp>(to_stream(s)),
+        {astype(a, dtype, s)});
+    if (!keepdims) {
+      out = squeeze(out, -1, s);
+    }
+    return out;
+  }
   auto maxval = stop_gradient(max(a, axes, true, s), s);
   auto out = log(sum(exp(subtract(a, maxval, s), s), axes, keepdims, s), s);
   out = add(out, reshape(maxval, out.shape(), s), s);
@@ -2817,6 +2864,19 @@ array matmul(
   }
   // Type promotion
   auto out_type = promote_types(a.dtype(), b.dtype());
+  // Complex matmul in terms of real matmuls
+  if (out_type == complex64) {
+    auto a_real = real(a, s);
+    auto b_real = real(b, s);
+    auto a_imag = imag(a, s);
+    auto b_imag = imag(b, s);
+    auto c_real =
+        subtract(matmul(a_real, b_real, s), matmul(a_imag, b_imag, s), s);
+    auto c_imag = add(matmul(a_real, b_imag, s), matmul(a_imag, b_real, s), s);
+    return add(
+        c_real, multiply(array(complex64_t{0, 1}, complex64), c_imag, s), s);
+  }
+
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
     msg << "[matmul] Only real floating point types are supported but "
@@ -3115,6 +3175,10 @@ array scatter_axis(
     throw std::invalid_argument(msg.str());
   }
 
+  if (a.size() == 0) {
+    return a;
+  }
+
   auto upd = astype(values, a.dtype(), s);
 
   // Squeeze leading singletons out of update
@@ -3325,8 +3389,14 @@ array softmax(
   if (a.size() == 0) {
     return a;
   }
+  if (a.ndim() == 0 && !axes.empty()) {
+    throw std::invalid_argument(
+        "[softmax] Received non-empty axes for array with 0 dimensions.");
+  }
 
-  if (axes.size() == 1 && (a.ndim() == axes[0] + 1 || axes[0] == -1)) {
+  bool is_complex = issubdtype(a.dtype(), complexfloating);
+  if (!is_complex && axes.size() == 1 &&
+      (a.ndim() == axes[0] + 1 || axes[0] == -1)) {
     auto dtype = at_least_float(a.dtype());
     return array(
         a.shape(),
@@ -3335,7 +3405,7 @@ array softmax(
         {astype(a, dtype, s)});
   } else {
     auto in = a;
-    if (precise) {
+    if (precise && !is_complex) {
       in = astype(a, float32, s);
     }
     auto a_max = stop_gradient(max(in, axes, /*keepdims = */ true, s), s);
@@ -3453,6 +3523,28 @@ array cummin(
       {a});
 }
 
+array logcumsumexp(
+    const array& a,
+    int axis,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  int ndim = a.ndim();
+  if (axis >= ndim || axis < -ndim) {
+    std::ostringstream msg;
+    msg << "[logcumsumexp] Axis " << axis << " is out of bounds for array with "
+        << a.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+  axis = (axis + a.ndim()) % a.ndim();
+  return array(
+      a.shape(),
+      a.dtype(),
+      std::make_shared<Scan>(
+          to_stream(s), Scan::ReduceType::LogAddExp, axis, reverse, inclusive),
+      {a});
+}
+
 /** Convolution operations */
 
 namespace {
@@ -3492,21 +3584,21 @@ Shape conv_out_shape(
 
   if (pads_lo.size() != spatial_dims || pads_hi.size() != spatial_dims) {
     std::ostringstream msg;
-    msg << "[conv] Invalid padding " << pads_lo << " | " << pads_hi << "for "
+    msg << "[conv] Invalid padding " << pads_lo << " | " << pads_hi << " for "
         << spatial_dims << "D convolution.";
     throw std::invalid_argument(msg.str());
   }
 
   if (kernel_dilation.size() != spatial_dims) {
     std::ostringstream msg;
-    msg << "[conv] Invalid kernel dilation " << kernel_dilation << "for "
+    msg << "[conv] Invalid kernel dilation " << kernel_dilation << " for "
         << spatial_dims << "D convolution.";
     throw std::invalid_argument(msg.str());
   }
 
   if (input_dilation.size() != spatial_dims) {
     std::ostringstream msg;
-    msg << "[conv] Invalid input dilation " << input_dilation << "for "
+    msg << "[conv] Invalid input dilation " << input_dilation << " for "
         << spatial_dims << "D convolution.";
     throw std::invalid_argument(msg.str());
   }
@@ -3696,6 +3788,7 @@ array conv_transpose_general(
     std::vector<int> stride,
     std::vector<int> padding,
     std::vector<int> dilation,
+    std::vector<int> output_padding,
     int groups,
     StreamOrDevice s) {
   std::vector<int> padding_lo(padding.size());
@@ -3709,7 +3802,8 @@ array conv_transpose_general(
 
     int in_size = 1 + (conv_output_shape - 1);
     int out_size = 1 + stride[i] * (input.shape(1 + i) - 1);
-    padding_hi[i] = in_size - out_size + padding[i];
+    padding_hi[i] = in_size - out_size + padding[i] +
+        output_padding[i]; // Adjust with output_padding
   }
 
   return conv_general(
@@ -3732,10 +3826,11 @@ array conv_transpose1d(
     int stride /* = 1 */,
     int padding /* = 0 */,
     int dilation /* = 1 */,
+    int output_padding /* = 0 */,
     int groups /* = 1 */,
     StreamOrDevice s /* = {} */) {
   return conv_transpose_general(
-      in_, wt_, {stride}, {padding}, {dilation}, groups, s);
+      in_, wt_, {stride}, {padding}, {dilation}, {output_padding}, groups, s);
 }
 
 /** 2D transposed convolution with a filter */
@@ -3745,6 +3840,7 @@ array conv_transpose2d(
     const std::pair<int, int>& stride /* = {1, 1} */,
     const std::pair<int, int>& padding /* = {0, 0} */,
     const std::pair<int, int>& dilation /* = {1, 1} */,
+    const std::pair<int, int>& output_padding /* = {0, 0} */,
     int groups /* = 1 */,
     StreamOrDevice s /* = {} */) {
   return conv_transpose_general(
@@ -3753,6 +3849,7 @@ array conv_transpose2d(
       {stride.first, stride.second},
       {padding.first, padding.second},
       {dilation.first, dilation.second},
+      {output_padding.first, output_padding.second},
       groups,
       s);
 }
@@ -3764,6 +3861,7 @@ array conv_transpose3d(
     const std::tuple<int, int, int>& stride /* = {1, 1, 1} */,
     const std::tuple<int, int, int>& padding /* = {0, 0, 0} */,
     const std::tuple<int, int, int>& dilation /* = {1, 1, 1} */,
+    const std::tuple<int, int, int>& output_padding /* = {0, 0, 0} */,
     int groups /* = 1 */,
     StreamOrDevice s /* = {} */) {
   return conv_transpose_general(
@@ -3772,6 +3870,9 @@ array conv_transpose3d(
       {std::get<0>(stride), std::get<1>(stride), std::get<2>(stride)},
       {std::get<0>(padding), std::get<1>(padding), std::get<2>(padding)},
       {std::get<0>(dilation), std::get<1>(dilation), std::get<2>(dilation)},
+      {std::get<0>(output_padding),
+       std::get<1>(output_padding),
+       std::get<2>(output_padding)},
       groups,
       s);
 }
@@ -3881,6 +3982,7 @@ array conv_general(
           to_stream(s),
           stride,
           padding_lo,
+          padding_hi,
           kernel_dilation,
           input_dilation,
           groups,
@@ -3955,6 +4057,7 @@ array gather_qmm(
     bool transpose /* = true */,
     int group_size /* = 64 */,
     int bits /* = 4 */,
+    bool sorted_indices /* = false */,
     StreamOrDevice s /* = {} */) {
   if (!lhs_indices_ && !rhs_indices_) {
     return quantized_matmul(
@@ -3994,13 +4097,19 @@ array gather_qmm(
   return array(
       std::move(out_shape),
       out_type,
-      std::make_shared<GatherQMM>(to_stream(s), group_size, bits, transpose),
+      std::make_shared<GatherQMM>(
+          to_stream(s),
+          group_size,
+          bits,
+          transpose,
+          sorted_indices && !rhs_indices_,
+          sorted_indices && !lhs_indices_),
       {astype(x, out_type, s),
-       w,
+       std::move(w),
        astype(scales, out_type, s),
        astype(biases, out_type, s),
-       lhs_indices,
-       rhs_indices});
+       std::move(lhs_indices),
+       std::move(rhs_indices)});
 }
 
 array tensordot(
@@ -4141,6 +4250,14 @@ array addmm(
 
   // Type promotion
   auto out_type = result_type(a, b, c);
+
+  if (out_type == complex64) {
+    return add(
+        multiply(matmul(a, b, s), array(alpha), s),
+        multiply(array(beta), c, s),
+        s);
+  }
+
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
     msg << "[addmm] Only real floating point types are supported but "
@@ -4216,6 +4333,10 @@ array addmm(
     }
 
     c = reshape(c, c_reshape, s);
+  }
+  if (c.shape() != out_shape) {
+    throw std::invalid_argument(
+        "[addmm] input c must broadcast to the output shape");
   }
 
   auto out = array(
@@ -4418,6 +4539,7 @@ array gather_mm(
     array b,
     std::optional<array> lhs_indices_ /* = std::nullopt */,
     std::optional<array> rhs_indices_ /* = std::nullopt */,
+    bool sorted_indices /* = false */,
     StreamOrDevice s /* = {} */) {
   // If no indices, fall back to full matmul
   if (!lhs_indices_ && !rhs_indices_) {
@@ -4493,12 +4615,18 @@ array gather_mm(
   out_shape.push_back(M);
   out_shape.push_back(N);
 
-  // Caculate array
+  // Make the output array
   auto out = array(
       std::move(out_shape),
       out_type,
-      std::make_shared<GatherMM>(to_stream(s)),
-      {a, b, lhs_indices, rhs_indices});
+      std::make_shared<GatherMM>(
+          to_stream(s),
+          sorted_indices && !rhs_indices_,
+          sorted_indices && !lhs_indices_),
+      {std::move(a),
+       std::move(b),
+       std::move(lhs_indices),
+       std::move(rhs_indices)});
 
   // Remove the possibly inserted singleton dimensions
   std::vector<int> axes;
@@ -4778,8 +4906,9 @@ array bitwise_impl(
     const array& b,
     BitwiseBinary::Op op,
     const std::string& op_name,
-    const StreamOrDevice& s) {
-  auto out_type = promote_types(a.dtype(), b.dtype());
+    const StreamOrDevice& s,
+    std::optional<Dtype> out_type_ = std::nullopt) {
+  auto out_type = out_type_ ? *out_type_ : promote_types(a.dtype(), b.dtype());
   if (!(issubdtype(out_type, integer) || out_type == bool_)) {
     std::ostringstream msg;
     msg << "[" << op_name
@@ -4820,31 +4949,46 @@ array operator^(const array& a, const array& b) {
 }
 
 array left_shift(const array& a, const array& b, StreamOrDevice s /* = {} */) {
-  // Bit shift on bool always up-casts to uint8
-  auto t = promote_types(result_type(a, b), uint8);
-  return bitwise_impl(
-      astype(a, t, s),
-      astype(b, t, s),
-      BitwiseBinary::Op::LeftShift,
-      "left_shift",
-      s);
+  auto t = result_type(a, b);
+  if (t == bool_) {
+    t = uint8;
+  }
+  return bitwise_impl(a, b, BitwiseBinary::Op::LeftShift, "left_shift", s, t);
 }
 array operator<<(const array& a, const array& b) {
   return left_shift(a, b);
 }
 
 array right_shift(const array& a, const array& b, StreamOrDevice s /* = {} */) {
-  // Bit shift on bool always up-casts to uint8
-  auto t = promote_types(result_type(a, b), uint8);
+  auto t = result_type(a, b);
+  if (t == bool_) {
+    t = uint8;
+  }
   return bitwise_impl(
       astype(a, t, s),
       astype(b, t, s),
       BitwiseBinary::Op::RightShift,
       "right_shift",
-      s);
+      s,
+      t);
 }
 array operator>>(const array& a, const array& b) {
   return right_shift(a, b);
+}
+
+array bitwise_invert(const array& a, StreamOrDevice s /* = {} */) {
+  if (issubdtype(a.dtype(), inexact)) {
+    throw std::invalid_argument(
+        "[bitwise_invert] Bitwise inverse only allowed on integer types.");
+  } else if (a.dtype() == bool_) {
+    return logical_not(a, s);
+  }
+  return array(
+      a.shape(), a.dtype(), std::make_shared<BitwiseInvert>(to_stream(s)), {a});
+}
+
+array operator~(const array& a) {
+  return bitwise_invert(a);
 }
 
 array view(const array& a, const Dtype& dtype, StreamOrDevice s /* = {} */) {
@@ -4905,8 +5049,11 @@ array roll(
     }
 
     auto sh = shift[i];
-    auto split_index =
-        (sh < 0) ? (-sh) % a.shape(ax) : a.shape(ax) - sh % a.shape(ax);
+    auto size = a.shape(ax);
+    if (size == 0) {
+      continue; // skip rolling this axis if it has size 0
+    }
+    auto split_index = (sh < 0) ? (-sh) % size : size - sh % size;
 
     auto parts = split(result, Shape{split_index}, ax, s);
     std::swap(parts[0], parts[1]);

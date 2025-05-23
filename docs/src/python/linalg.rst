@@ -5,8 +5,8 @@ Linear Algebra
 
 .. currentmodule:: mlx.core.linalg
 
-.. autosummary:: 
-   :toctree: _autosummary 
+.. autosummary::
+   :toctree: _autosummary
 
     inv
     tri_inv
@@ -16,5 +16,12 @@ Linear Algebra
     cross
     qr
     svd
+    eigvals
+    eig
     eigvalsh
     eigh
+    lu
+    lu_factor
+    pinv
+    solve
+    solve_triangular

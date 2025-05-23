@@ -128,6 +128,30 @@ class TestLoad(mlx_tests.MLXTestCase):
                             mx.array_equal(load_dict["test"], save_dict["test"])
                         )
 
+    def test_load_f8_e4m3(self):
+        if not os.path.isdir(self.test_dir):
+            os.mkdir(self.test_dir)
+
+        expected = [
+            0,
+            mx.nan,
+            mx.nan,
+            -0.875,
+            0.4375,
+            -0.005859,
+            -1.25,
+            -1.25,
+            -1.5,
+            -0.0039,
+        ]
+        expected = mx.array(expected, dtype=mx.bfloat16)
+        contents = b'H\x00\x00\x00\x00\x00\x00\x00{"tensor":{"dtype":"F8_E4M3","shape":[10],"data_offsets":[0,10]}}       \x00\x7f\xff\xb6.\x83\xba\xba\xbc\x82'
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            f.write(contents)
+            f.seek(0)
+            out = mx.load(f)["tensor"]
+        self.assertTrue(mx.allclose(out[0], expected[0], equal_nan=True))
+
     def test_save_and_load_gguf_metadata_basic(self):
         if not os.path.isdir(self.test_dir):
             os.mkdir(self.test_dir)
@@ -355,6 +379,24 @@ class TestLoad(mlx_tests.MLXTestCase):
         mx.save_gguf(save_file, {"a": a})
         aload = mx.load(save_file)["a"]
         self.assertTrue(mx.array_equal(a, aload))
+
+    def test_load_donation(self):
+        x = mx.random.normal((1024,))
+        mx.eval(x)
+        save_file = os.path.join(self.test_dir, "donation.npy")
+        mx.save(save_file, x)
+        mx.synchronize()
+
+        mx.reset_peak_memory()
+        scale = mx.array(2.0)
+        y = mx.load(save_file)
+        mx.eval(y)
+        load_only = mx.get_peak_memory()
+        y = mx.load(save_file) * scale
+        mx.eval(y)
+        load_with_binary = mx.get_peak_memory()
+
+        self.assertEqual(load_only, load_with_binary)
 
 
 if __name__ == "__main__":

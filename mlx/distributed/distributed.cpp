@@ -6,31 +6,33 @@
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/distributed/mpi/mpi.h"
 #include "mlx/distributed/ring/ring.h"
-#include "mlx/scheduler.h"
 
 namespace mlx::core::distributed {
 
 namespace detail {
 
-Stream communication_stream() {
-  static Stream comm_stream = new_stream(Device::cpu);
-  return comm_stream;
+void all_sum(Group group, const array& input, array& output, Stream stream) {
+  group.raw_group()->all_sum(input, output, stream);
 }
 
-void all_sum(Group group, const array& input, array& output) {
-  group.raw_group()->all_sum(input, output);
+void all_max(Group group, const array& input, array& output, Stream stream) {
+  group.raw_group()->all_max(input, output, stream);
 }
 
-void all_gather(Group group, const array& input, array& output) {
-  group.raw_group()->all_gather(input, output);
+void all_min(Group group, const array& input, array& output, Stream stream) {
+  group.raw_group()->all_min(input, output, stream);
 }
 
-void send(Group group, const array& input, int dst) {
-  group.raw_group()->send(input, dst);
+void all_gather(Group group, const array& input, array& output, Stream stream) {
+  group.raw_group()->all_gather(input, output, stream);
 }
 
-void recv(Group group, array& out, int src) {
-  group.raw_group()->recv(out, src);
+void send(Group group, const array& input, int dst, Stream stream) {
+  group.raw_group()->send(input, dst, stream);
+}
+
+void recv(Group group, array& out, int src, Stream stream) {
+  group.raw_group()->recv(out, src, stream);
 }
 
 class EmptyGroup : public GroupImpl {
@@ -47,19 +49,29 @@ class EmptyGroup : public GroupImpl {
     throw std::runtime_error("Cannot split the distributed group further.");
   }
 
-  void all_sum(const array& input, array& output) override {
+  void all_sum(const array&, array&, Stream) override {
     throw std::runtime_error(
         "Communication not implemented in an empty distributed group.");
   }
-  void all_gather(const array& input, array& output) override {
+  void all_gather(const array&, array&, Stream) override {
     throw std::runtime_error(
         "Communication not implemented in an empty distributed group.");
   }
-  void send(const array& input, int dst) override {
+  void send(const array&, int, Stream) override {
     throw std::runtime_error(
         "Communication not implemented in an empty distributed group.");
   }
-  void recv(array& out, int src) override {
+  void recv(array&, int, Stream) override {
+    throw std::runtime_error(
+        "Communication not implemented in an empty distributed group.");
+  }
+
+  void all_max(const array&, array&, Stream) override {
+    throw std::runtime_error(
+        "Communication not implemented in an empty distributed group.");
+  }
+
+  void all_min(const array&, array&, Stream) override {
     throw std::runtime_error(
         "Communication not implemented in an empty distributed group.");
   }
@@ -122,10 +134,6 @@ Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
     backends.insert({"any", group});
   }
   backends.insert({std::move(bk_), group});
-
-  // Ensure the communication stream is alive before
-  // the graph is evaluated
-  detail::communication_stream();
   return Group(group);
 }
 

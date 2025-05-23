@@ -1,112 +1,16 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <memory>
 
+#include <sys/sysctl.h>
+
 #include "mlx/backend/metal/device.h"
-#include "mlx/backend/metal/event.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
-#include "mlx/primitives.h"
-#include "mlx/scheduler.h"
-#include "mlx/utils.h"
 
 namespace mlx::core::metal {
 
 bool is_available() {
   return true;
-}
-
-inline void check_error(MTL::CommandBuffer* cbuf) {
-  if (cbuf->status() == MTL::CommandBufferStatusError) {
-    std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
-    throw std::runtime_error(msg.str());
-  }
-}
-
-std::function<void()> make_task(array arr, bool signal) {
-  auto task = [arr = std::move(arr), signal]() mutable {
-    auto pool = new_scoped_memory_pool();
-    auto s = arr.primitive().stream();
-    auto& d = metal::device(s.device);
-    auto command_buffer = d.get_command_buffer(s.index);
-    d.increment_command_buffer_ops(s.index);
-
-    for (auto& input : arr.inputs()) {
-      if (input.event().valid() &&
-          input.event().stream() != arr.primitive().stream()) {
-        input.event().wait();
-      }
-    }
-
-    auto outputs = arr.outputs();
-    {
-      // If the array is a tracer hold a reference
-      // to its inputs so they don't get donated
-      std::vector<array> inputs;
-      if (arr.is_tracer()) {
-        inputs = arr.inputs();
-      }
-
-      debug_set_primitive_buffer_label(command_buffer, arr.primitive());
-      try {
-        arr.primitive().eval_gpu(arr.inputs(), outputs);
-      } catch (const std::exception& error) {
-        abort_with_exception(error);
-      }
-    }
-    std::vector<std::shared_ptr<array::Data>> buffers;
-    for (auto& in : arr.inputs()) {
-      buffers.push_back(in.data_shared_ptr());
-    }
-    for (auto& s : arr.siblings()) {
-      buffers.push_back(s.data_shared_ptr());
-    }
-    if (!arr.is_tracer()) {
-      arr.detach();
-    }
-    for (auto& out : outputs) {
-      out.set_status(array::Status::evaluated);
-    }
-
-    if (signal ||
-        d.get_command_buffer_ops(s.index) >= env::max_ops_per_buffer()) {
-      if (signal) {
-        encode_signal(arr.event());
-      }
-      d.end_encoding(s.index);
-      scheduler::notify_new_task(s);
-      command_buffer->addCompletedHandler(
-          [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-            scheduler::notify_task_completion(s);
-            check_error(cbuf);
-          });
-      d.commit_command_buffer(s.index);
-      d.get_command_buffer(s.index);
-    } else {
-      command_buffer->addCompletedHandler(
-          [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-            check_error(cbuf);
-          });
-    }
-  };
-  return task;
-}
-
-std::function<void()> make_synchronize_task(
-    Stream s,
-    std::shared_ptr<std::promise<void>> p) {
-  return [s, p = std::move(p)]() {
-    auto pool = new_scoped_memory_pool();
-    auto& d = metal::device(s.device);
-    auto cb = d.get_command_buffer(s.index);
-    cb->retain();
-    d.end_encoding(s.index);
-    d.commit_command_buffer(s.index);
-    cb->waitUntilCompleted();
-    check_error(cb);
-    cb->release();
-    p->set_value();
-  };
 }
 
 void start_capture(std::string path, id object) {
@@ -143,6 +47,38 @@ void stop_capture() {
   auto pool = new_scoped_memory_pool();
   auto manager = MTL::CaptureManager::sharedCaptureManager();
   manager->stopCapture();
+}
+
+const std::unordered_map<std::string, std::variant<std::string, size_t>>&
+device_info() {
+  auto init_device_info = []()
+      -> std::unordered_map<std::string, std::variant<std::string, size_t>> {
+    auto pool = new_scoped_memory_pool();
+    auto raw_device = device(default_device()).mtl_device();
+    auto name = std::string(raw_device->name()->utf8String());
+    auto arch = std::string(raw_device->architecture()->name()->utf8String());
+
+    size_t memsize = 0;
+    size_t length = sizeof(memsize);
+    sysctlbyname("hw.memsize", &memsize, &length, NULL, 0);
+
+    size_t rsrc_limit = 0;
+    sysctlbyname("iogpu.rsrc_limit", &rsrc_limit, &length, NULL, 0);
+    if (rsrc_limit == 0) {
+      rsrc_limit = 499000;
+    }
+
+    return {
+        {"device_name", name},
+        {"architecture", arch},
+        {"max_buffer_length", raw_device->maxBufferLength()},
+        {"max_recommended_working_set_size",
+         raw_device->recommendedMaxWorkingSetSize()},
+        {"memory_size", memsize},
+        {"resource_limit", rsrc_limit}};
+  };
+  static auto device_info_ = init_device_info();
+  return device_info_;
 }
 
 } // namespace mlx::core::metal
