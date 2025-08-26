@@ -18,6 +18,7 @@ namespace fast {
 CustomKernelFunction cuda_kernel(
     const std::string&,
     const std::vector<std::string>&,
+    const std::vector<bool>&,
     const std::vector<std::string>&,
     const std::string&,
     const std::string&,
