@@ -83,6 +83,7 @@ using CustomKernelFunction = std::function<std::vector<array>(
 CustomKernelFunction metal_kernel(
     const std::string& name,
     const std::vector<std::string>& input_names,
+    const std::vector<bool>& input_rw_status,
     const std::vector<std::string>& output_names,
     const std::string& source,
     const std::string& header = "",

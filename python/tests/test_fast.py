@@ -601,6 +601,7 @@ class TestFast(mlx_tests.MLXTestCase):
         kernel = custom_kernel(
             name="basic",
             input_names=["a"],
+            input_rw_status=[False],
             output_names=["out1"],
             source=source,
         )
@@ -648,6 +649,7 @@ class TestFast(mlx_tests.MLXTestCase):
         kernel = custom_kernel(
             name="arg_test",
             input_names=["a", "b", "c", "d"],
+            input_rw_status=[False, False, False, False],
             output_names=["out1", "out2"],
             source=source,
         )
@@ -712,6 +714,7 @@ class TestFast(mlx_tests.MLXTestCase):
             kernel = custom_kernel(
                 name="myexp" + str(contig),
                 input_names=["inp"],
+                input_rw_status=[False],
                 output_names=["out"],
                 source=source_contig if contig else source,
                 ensure_row_contiguous=contig,
@@ -759,6 +762,7 @@ class TestFast(mlx_tests.MLXTestCase):
         kernel = custom_kernel(
             name="helper",
             input_names=["a"],
+            input_rw_status=[False],
             output_names=["out1"],
             header=header,
             source=source,
@@ -786,6 +790,7 @@ class TestFast(mlx_tests.MLXTestCase):
         kernel = custom_kernel(
             name="test_fun",
             input_names=["a"],
+            input_rw_status=[False],
             output_names=["out"],
             source=source,
         )
@@ -805,6 +810,7 @@ class TestFast(mlx_tests.MLXTestCase):
             kernel = mx.fast.metal_kernel(
                 name="my_kernel",
                 input_names=["inp"],
+                input_rw_status=[False],
                 output_names=["out"],
                 source=source,
             )

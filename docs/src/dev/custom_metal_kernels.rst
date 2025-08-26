@@ -23,6 +23,7 @@ Let's write a custom kernel that computes ``exp`` elementwise:
   kernel = mx.fast.metal_kernel(
       name="myexp",
       input_names=["inp"],
+      input_rw_status=[False],
       output_names=["out"],
       source=source,
   )
@@ -126,6 +127,7 @@ relying on a copy from ``ensure_row_contiguous``:
   kernel = mx.fast.metal_kernel(
       name="myexp_strided",
       input_names=["inp"],
+      input_rw_status=[False],
       output_names=["out"],
       source=source
       ensure_row_contiguous=False,
@@ -258,6 +260,7 @@ First we'll implement the forward pass as a fused kernel:
   kernel = mx.fast.metal_kernel(
       name="grid_sample",
       input_names=["x", "grid"],
+      input_rw_status=[False, False],
       output_names=["out"],
       source=source,
   )
@@ -411,6 +414,7 @@ We can then implement the backwards pass as follows:
   kernel = mx.fast.metal_kernel(
       name="grid_sample_grad",
       input_names=["x", "grid", "cotangent"],
+      input_rw_status=[False, False, False],
       output_names=["x_grad", "grid_grad"],
       source=source,
       atomic_outputs=True,

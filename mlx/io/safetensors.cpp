@@ -129,7 +129,7 @@ array f8_e4m3_to_float(array x, Dtype dtype, StreamOrDevice s) {
       float out = *(reinterpret_cast<thread float*>(&result));
       y[elem] = static_cast<T>(out);
     )";
-    auto kernel = fast::metal_kernel("f8_e4m3", {"x"}, {"y"}, source);
+    auto kernel = fast::metal_kernel("f8_e4m3", {"x"}, {false},{"y"}, source);
     auto outputs = kernel(
         {x},
         {x.shape()},

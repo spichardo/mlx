@@ -27,6 +27,7 @@ std::string write_signature(
     const std::string& header,
     const std::string& source,
     const std::vector<std::string>& input_names,
+    const std::vector<bool>& input_rw_status,
     const std::vector<array>& inputs,
     const std::vector<std::string>& output_names,
     const std::vector<Dtype>& output_dtypes,
@@ -71,11 +72,14 @@ std::string write_signature(
   for (int i = 0; i < inputs.size(); ++i) {
     const auto& name = input_names[i];
     const auto& arr = inputs[i];
+    const auto& rw = input_rw_status[i];
     auto dtype = get_type_string(arr.dtype());
     std::string location =
         arr.size() < max_constant_array_size ? "constant" : "device";
     std::string ref = arr.ndim() == 0 ? "&" : "*";
-    kernel_source += "  const ";
+    if (!rw) { //if read-only (default), otherwise read-write
+       kernel_source += "  const ";
+    }
     kernel_source += location;
     kernel_source += " ";
     kernel_source += dtype;
@@ -175,6 +179,7 @@ std::string write_template(
 CustomKernelFunction metal_kernel(
     const std::string& name,
     const std::vector<std::string>& input_names,
+    const std::vector<bool>& input_rw_status,
     const std::vector<std::string>& output_names,
     const std::string& source,
     const std::string& header /* = "" */,
@@ -242,6 +247,13 @@ CustomKernelFunction metal_kernel(
           << std::endl;
       throw std::invalid_argument(msg.str());
     }
+    if (inputs.size() != input_rw_status.size()) {
+      std::ostringstream msg;
+      msg << "[metal_kernel] Expected `input_rw_status` to have size "
+          << input_names.size() << " but got size " << input_rw_status.size() << "."
+          << std::endl;
+      throw std::invalid_argument(msg.str());
+    }
     if (output_shapes.size() != output_names.size()) {
       std::ostringstream msg;
       msg << "[metal_kernel] Expected `output_shapes` to have size "
@@ -279,6 +291,7 @@ CustomKernelFunction metal_kernel(
         header,
         source,
         input_names,
+        input_rw_status,
         inputs,
         output_names,
         output_dtypes,
