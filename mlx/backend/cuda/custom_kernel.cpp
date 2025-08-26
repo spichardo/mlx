@@ -53,6 +53,7 @@ std::string build_kernel(
     const std::string& header,
     const std::string& source,
     const std::vector<std::string>& input_names,
+    const std::vector<bool>& input_rw_status,
     const std::vector<array>& inputs,
     const std::vector<std::string>& output_names,
     const std::vector<Dtype>& output_dtypes,
@@ -74,7 +75,10 @@ std::string build_kernel(
   for (int i = 0; i < inputs.size(); ++i) {
     const auto& name = input_names[i];
     const auto& arr = inputs[i];
-    kernel_source += "    const ";
+    const auto& rw = input_rw_status[i];
+    if (!rw) { //if read-only (default), otherwise read-write
+       kernel_source += "  const ";
+    }
     kernel_source += dtype_to_cuda_type(arr.dtype());
     kernel_source += "* ";
     kernel_source += name;
@@ -144,6 +148,7 @@ std::string build_kernel(
 CustomKernelFunction cuda_kernel(
     const std::string& name,
     const std::vector<std::string>& input_names,
+    const std::vector<bool>& input_rw_status,
     const std::vector<std::string>& output_names,
     const std::string& source,
     const std::string& header,
@@ -181,6 +186,20 @@ CustomKernelFunction cuda_kernel(
           << std::endl;
       throw std::invalid_argument(msg.str());
     }
+    if (inputs.size() != input_names.size()) {
+      std::ostringstream msg;
+      msg << "[custom_kernel] Expected `inputs` to have size "
+          << input_names.size() << " but got size " << inputs.size() << "."
+          << std::endl;
+      throw std::invalid_argument(msg.str());
+    }
+    if (inputs.size() != input_rw_status.size()) {
+      std::ostringstream msg;
+      msg << "[metal_kernel] Expected `input_rw_status` to have size "
+          << input_names.size() << " but got size " << input_rw_status.size() << "."
+          << std::endl;
+      throw std::invalid_argument(msg.str());
+    }
     if (output_shapes.size() != output_names.size()) {
       std::ostringstream msg;
       msg << "[custom_kernel] Expected `output_shapes` to have size "
@@ -208,6 +227,7 @@ CustomKernelFunction cuda_kernel(
         header,
         source,
         input_names,
+        input_rw_status,
         inputs,
         output_names,
         output_dtypes,

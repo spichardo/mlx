@@ -408,6 +408,7 @@ void init_fast(nb::module_& parent_module) {
       "cuda_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,
+         const std::vector<bool>& input_rw_status,
          const std::vector<std::string>& output_names,
          const std::string& source,
          const std::string& header,
@@ -416,6 +417,7 @@ void init_fast(nb::module_& parent_module) {
         auto kernel = mx::fast::cuda_kernel(
             name,
             input_names,
+            input_rw_status,
             output_names,
             source,
             header,
@@ -458,6 +460,7 @@ void init_fast(nb::module_& parent_module) {
       },
       "name"_a,
       "input_names"_a,
+      "input_rw_status"_a,
       "output_names"_a,
       "source"_a,
       "header"_a = "",
@@ -472,6 +475,7 @@ void init_fast(nb::module_& parent_module) {
         name (str): Name for the kernel.
         input_names (List[str]): The parameter names of the inputs in the
            function signature.
+        input_rw_status (List[bool]): The read/write status of each input.
         output_names (List[str]): The parameter names of the outputs in the
            function signature.
         source (str): Source code. This is the body of a function in CUDA,
@@ -501,6 +505,7 @@ void init_fast(nb::module_& parent_module) {
               kernel = mx.fast.cuda_kernel(
                   name="myexp",
                   input_names=["inp"],
+                  input_rw_status=[False],  # False for read-only input
                   output_names=["out"],
                   source=source
               )
