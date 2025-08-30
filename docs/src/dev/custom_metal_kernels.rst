@@ -129,7 +129,7 @@ relying on a copy from ``ensure_row_contiguous``:
       input_names=["inp"],
       input_rw_status=[False],
       output_names=["out"],
-      source=source
+      source=source,
       ensure_row_contiguous=False,
   )
 
