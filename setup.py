@@ -121,7 +121,8 @@ class CMakeBuild(build_ext):
             build_args += [f"-j{os.cpu_count()}"]
 
         # Avoid cache miss when building from temporary dirs.
-        os.environ["CCACHE_BASEDIR"] = os.path.abspath(self.build_temp)
+        os.environ["CCACHE_BASEDIR"] = os.path.realpath(self.build_temp)
+        os.environ["CCACHE_NOHASHDIR"] = "true"
 
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True
@@ -176,10 +177,6 @@ class GenerateStubs(Command):
         # Run again without recursive to specify output file name
         subprocess.run(["rm", f"{out_path}/mlx.pyi"])
         subprocess.run(stub_cmd + ["-o", f"{out_path}/__init__.pyi"])
-        # mx.bool_ gets filtered by nanobind because of the trailing
-        # underscore, add it manually:
-        with open(f"{out_path}/__init__.pyi", "a") as fid:
-            fid.write("\nbool_: Dtype = ...")
 
 
 class MLXBdistWheel(bdist_wheel):
