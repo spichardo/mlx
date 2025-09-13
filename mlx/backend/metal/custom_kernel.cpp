@@ -333,8 +333,8 @@ CustomKernelFunction metal_kernel(
             init_value,
             std::vector<ScalarArg>{},
             false,
-            false,
-            0),
+            0,
+            use_optimal_threadgroups),
         std::move(inputs));
   };
 }

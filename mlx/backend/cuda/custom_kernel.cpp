@@ -256,8 +256,8 @@ CustomKernelFunction cuda_kernel(
             init_value,
             std::vector<ScalarArg>{},
             false,
-            false,
-            shared_memory),
+            shared_memory,
+            use_optimal_threadgroups),
         std::move(inputs));
   };
 }
@@ -291,8 +291,8 @@ std::vector<array> precompiled_cuda_kernel(
           init_value,
           scalars,
           true,
-          false,
-          shared_memory),
+          shared_memory,
+          use_optimal_threadgroups),
       inputs);
 }
 
