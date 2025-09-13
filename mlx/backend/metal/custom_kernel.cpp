@@ -239,6 +239,7 @@ CustomKernelFunction metal_kernel(
                  template_args = {},
              std::optional<float> init_value = std::nullopt,
              bool verbose = false,
+             bool use_optimal_threadgroups = false,
              StreamOrDevice s_ = {}) {
     if (inputs.size() != input_names.size()) {
       std::ostringstream msg;
@@ -332,6 +333,7 @@ CustomKernelFunction metal_kernel(
             init_value,
             std::vector<ScalarArg>{},
             false,
+            false,
             0),
         std::move(inputs));
   };
@@ -416,8 +418,18 @@ void CustomKernel::eval_gpu(
     index++;
   }
 
-  const auto [tx, ty, tz] = threadgroup_;
-  auto tg_size = tx * ty * tz;
+  if (use_optimal_threadgroups_) {
+      const auto w = kernel->threadExecutionWidth();
+      const auto h = kernel->maxTotalThreadsPerThreadgroup() / w;
+      const auto [gx, gy, gz] = grid_;
+      MTL::Size numThreadgroups =
+          MTL::Size((gx * gy * gz + (w * h - 1)) / (w * h), 1, 1);
+      MTL::Size threadsPerThreadgroup = MTL::Size(w * h, 1, 1);
+      compute_encoder.dispatch_threadgroups(
+          numThreadgroups, threadsPerThreadgroup);
+  } else {
+    const auto [tx, ty, tz] = threadgroup_;
+    auto tg_size = tx * ty * tz;
   auto max_tg_size = kernel->maxTotalThreadsPerThreadgroup();
   if (tg_size > max_tg_size) {
     std::ostringstream msg;
@@ -426,12 +438,13 @@ void CustomKernel::eval_gpu(
         << ").";
     throw std::invalid_argument(msg.str());
   }
-
-  const auto [gx, gy, gz] = grid_;
-  MTL::Size group_dims =
-      MTL::Size(std::min(tx, gx), std::min(ty, gy), std::min(tz, gz));
-  MTL::Size grid_dims = MTL::Size(gx, gy, gz);
-  compute_encoder.dispatch_threads(grid_dims, group_dims);
+  
+    const auto [gx, gy, gz] = grid_;
+    MTL::Size group_dims =
+        MTL::Size(std::min(tx, gx), std::min(ty, gy), std::min(tz, gz));
+    MTL::Size grid_dims = MTL::Size(gx, gy, gz);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+  }
 
   d.add_temporaries(std::move(copies), s.index);
 }

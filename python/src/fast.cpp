@@ -33,6 +33,7 @@ struct PyCustomKernelFunction {
           template_args_ = std::nullopt,
       std::optional<float> init_value = std::nullopt,
       bool verbose = false,
+      bool use_optimal_threadgroups = false,
       mx::StreamOrDevice s = {}) const {
     std::vector<mx::array> inputs;
     for (const auto& value : inputs_) {
@@ -68,6 +69,7 @@ struct PyCustomKernelFunction {
         template_args,
         init_value,
         verbose,
+        use_optimal_threadgroups,
         s);
   }
 
@@ -312,9 +314,10 @@ void init_fast(nb::module_& parent_module) {
             "template"_a = nb::none(),
             "init_value"_a = nb::none(),
             "verbose"_a = false,
+            "use_optimal_threadgroups"_a = false,
             "stream"_a = nb::none(),
             nb::sig(
-                "def __call__(self, *, inputs: List[Union[scalar, array]], output_shapes: List[Sequence[int]], output_dtypes: List[Dtype], grid: tuple[int, int, int], threadgroup: tuple[int, int, int], template: Optional[List[Tuple[str, Union[bool, int, Dtype]]]] = None, init_value: Optional[float] = None, verbose: bool = false, stream: Union[None, Stream, Device] = None)"),
+                "def __call__(self, *, inputs: List[Union[scalar, array]], output_shapes: List[Sequence[int]], output_dtypes: List[Dtype], grid: tuple[int, int, int], threadgroup: tuple[int, int, int], template: Optional[List[Tuple[str, Union[bool, int, Dtype]]]] = None, init_value: Optional[float] = None, verbose: bool = false, use_optimal_threadgroups: bool = false, stream: Union[None, Stream, Device] = None)"),
             R"pbdoc(
             Run the kernel.
 
@@ -332,6 +335,11 @@ void init_fast(nb::module_& parent_module) {
                   By default, output arrays are uninitialized. Default: ``None``.
               verbose (bool, optional): Whether to print the full generated source code of the kernel
                   when it is run. Default: ``False``.
+              use_optimal_threadgroups (bool, optional): Whether to use dispatch_threadgroups instead of 
+                  dispatch_threads (the default) to execute the custom kernel. If True, the optimal grid 
+                  and threadgroup will be calculated for optimal occupancy. However, the programming of 
+                  the kernel must assume a flattened operation equivalent to a new grid specification with 
+                  [grid[0]*grid[1]*grid[2],1,1]. Default: ``False``.
               stream (mx.stream, optional): Stream to run the kernel on. Default: ``None``.
 
             Returns:
@@ -434,9 +442,10 @@ void init_fast(nb::module_& parent_module) {
             "template"_a = nb::none(),
             "init_value"_a = nb::none(),
             "verbose"_a = false,
+            "use_optimal_threadgroups"_a = false,
             "stream"_a = nb::none(),
             nb::sig(
-                "def __call__(self, *, inputs: List[Union[scalar, array]], output_shapes: List[Sequence[int]], output_dtypes: List[Dtype], grid: tuple[int, int, int], threadgroup: tuple[int, int, int], template: Optional[List[Tuple[str, Union[bool, int, Dtype]]]] = None, init_value: Optional[float] = None, verbose: bool = false, stream: Union[None, Stream, Device] = None)"),
+                "def __call__(self, *, inputs: List[Union[scalar, array]], output_shapes: List[Sequence[int]], output_dtypes: List[Dtype], grid: tuple[int, int, int], threadgroup: tuple[int, int, int], template: Optional[List[Tuple[str, Union[bool, int, Dtype]]]] = None, init_value: Optional[float] = None, verbose: bool = false, use_optimal_threadgroups: bool = false, stream: Union[None, Stream, Device] = None)"),
             R"pbdoc(
             Run the kernel.
 
@@ -453,6 +462,11 @@ void init_fast(nb::module_& parent_module) {
                   By default, output arrays are uninitialized. Default: ``None``.
               verbose (bool, optional): Whether to print the full generated source code of the kernel
                   when it is run. Default: ``False``.
+              use_optimal_threadgroups (bool, optional): Whether to use dispatch_threadgroups instead of
+                  dispatch_threads (the default) to execute the custom kernel. If True, the optimal grid
+                  and threadgroup will be calculated for optimal occupancy. However, the programming of
+                  the kernel must assume a flattened operation equivalent to a new grid specification with
+                  [grid[0]*grid[1]*grid[2],1,1]. Default: ``False``.
               stream (mx.stream, optional): Stream to run the kernel on. Default: ``None``.
 
             Returns:

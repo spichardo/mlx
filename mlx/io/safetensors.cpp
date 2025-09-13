@@ -139,6 +139,7 @@ array f8_e4m3_to_float(array x, Dtype dtype, StreamOrDevice s) {
         {{"T", dtype}},
         std::nullopt,
         false,
+        false,
         s);
     return outputs[0];
   } else {

@@ -302,7 +302,8 @@ class CustomKernel : public Primitive {
       std::optional<float> init_value,
       std::vector<ScalarArg> scalar_arguments,
       bool is_precompiled,
-      int shared_memory)
+      int shared_memory,
+      bool use_optimal_threadgroups)
       : Primitive(stream),
         source_(std::move(source)),
         name_(std::move(name)),
@@ -313,7 +314,8 @@ class CustomKernel : public Primitive {
         init_value_(init_value),
         scalar_arguments_(std::move(scalar_arguments)),
         is_precompiled_(is_precompiled),
-        shared_memory_(shared_memory) {}
+        shared_memory_(shared_memory),
+        use_optimal_threadgroups_(use_optimal_threadgroups) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -336,6 +338,7 @@ class CustomKernel : public Primitive {
   std::vector<ScalarArg> scalar_arguments_;
   bool is_precompiled_;
   int shared_memory_;
+  bool use_optimal_threadgroups_;
 };
 
 } // namespace mlx::core::fast
