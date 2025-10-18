@@ -30,15 +30,20 @@ SmallSizePool::SmallSizePool() {
   next_free_ = buffer_;
 
   CHECK_CUDA_ERROR(cudaMallocManaged(&data_, small_pool_size));
+
+  int device_count = 0;
+  CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
+  for (int i = 0; i < device_count; ++i) {
 #if CUDART_VERSION >= 13000
-  cudaMemLocation loc;
-  loc.type = cudaMemLocationTypeDevice;
-  loc.id = 0;
+    cudaMemLocation loc;
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = i;
 #else
-  int loc = 0;
+    int loc = i;
 #endif // CUDART_VERSION >= 13000
-  CHECK_CUDA_ERROR(
-      cudaMemAdvise(data_, small_pool_size, cudaMemAdviseSetReadMostly, loc));
+    CHECK_CUDA_ERROR(
+        cudaMemAdvise(data_, small_pool_size, cudaMemAdviseSetAccessedBy, loc));
+  }
 
   auto curr = next_free_;
   for (size_t i = 1; i < num_blocks; ++i) {
@@ -86,7 +91,7 @@ CudaAllocator::CudaAllocator()
   // TODO: Set memory limit for multi-device.
   size_t free, total;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total));
-  memory_limit_ = total * 0.8;
+  memory_limit_ = total * 0.95;
   max_pool_size_ = memory_limit_;
 }
 

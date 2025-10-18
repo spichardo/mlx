@@ -99,6 +99,30 @@ const std::filesystem::path& ptx_cache_dir() {
   return cache;
 }
 
+std::filesystem::path get_ptx_path(
+    const std::filesystem::path& cache_dir,
+    const std::string& module_name) {
+#ifdef _WIN32
+  constexpr int max_file_name_length = 140;
+#else
+  constexpr int max_file_name_length = 245;
+#endif
+
+  if (module_name.size() <= max_file_name_length) {
+    return cache_dir / (module_name + ".ptx");
+  }
+
+  auto ptx_path = cache_dir;
+  int offset = 0;
+  while (module_name.size() - offset > max_file_name_length) {
+    ptx_path /= module_name.substr(offset, max_file_name_length);
+    offset += max_file_name_length;
+  }
+  ptx_path /= module_name.substr(offset) + ".ptx";
+
+  return ptx_path;
+}
+
 // Try to read the cached |ptx| and |ptx_kernels| from |cache_dir|.
 bool read_cached_ptx(
     const std::filesystem::path& cache_dir,
@@ -109,7 +133,7 @@ bool read_cached_ptx(
     return false;
   }
 
-  auto ptx_path = cache_dir / (module_name + ".ptx");
+  auto ptx_path = get_ptx_path(cache_dir, module_name);
   std::error_code error;
   auto ptx_size = std::filesystem::file_size(ptx_path, error);
   if (error) {
@@ -122,7 +146,7 @@ bool read_cached_ptx(
   ptx.resize(ptx_size);
   ptx_file.read(ptx.data(), ptx_size);
 
-  std::ifstream txt_file(cache_dir / (module_name + ".txt"), std::ios::binary);
+  std::ifstream txt_file(ptx_path.replace_extension(".txt"), std::ios::binary);
   std::string line;
   while (std::getline(txt_file, line)) {
     auto tab = line.find('\t');
@@ -144,16 +168,26 @@ void write_cached_ptx(
     return;
   }
 
-  std::ofstream ptx_file(cache_dir / (module_name + ".ptx"), std::ios::binary);
+  auto ptx_path = get_ptx_path(cache_dir, module_name);
+
+  // Ensure that the directory exists
+  auto parent = ptx_path.parent_path();
+  if (parent != cache_dir) {
+    std::filesystem::create_directories(parent);
+  }
+
+  // Write the compiled code and mangled names
+  std::ofstream ptx_file(ptx_path, std::ios::binary);
   if (!ptx.empty()) {
     ptx_file.write(&ptx.front(), ptx.size());
   }
-  std::ofstream txt_file(cache_dir / (module_name + ".txt"), std::ios::binary);
+  std::ofstream txt_file(ptx_path.replace_extension(".txt"), std::ios::binary);
   for (const auto& [name, mangled] : ptx_kernels) {
     txt_file << name << "\t" << mangled << std::endl;
   }
 
-  std::ofstream source_file(cache_dir / (module_name + ".cu"));
+  // Write the generated code
+  std::ofstream source_file(ptx_path.replace_extension(".cu"));
   source_file << source_code;
 }
 
@@ -297,7 +331,8 @@ void load_module(
     const std::string& ptx,
     const std::vector<std::pair<std::string, std::string>>& ptx_kernels,
     CUmodule& module_,
-    std::unordered_map<std::string, std::pair<CUfunction, bool>>& kernels) {
+    std::unordered_map<std::string, std::tuple<CUfunction, bool, uint>>&
+        kernels) {
   // Load module.
   char jit_log[4089] = {};
   CUjit_option options[] = {
@@ -314,7 +349,7 @@ void load_module(
   for (const auto& [name, mangled] : ptx_kernels) {
     CUfunction kernel;
     CHECK_CUDA_ERROR(cuModuleGetFunction(&kernel, module_, mangled.c_str()));
-    kernels[name] = std::make_pair(kernel, false);
+    kernels[name] = std::make_tuple(kernel, false, 0);
   }
 }
 
@@ -358,7 +393,7 @@ JitModule::~JitModule() {
   CHECK_CUDA_ERROR(cuModuleUnload(module_));
 }
 
-CUfunction JitModule::get_kernel(
+std::pair<CUfunction, uint> JitModule::get_kernel_and_dims(
     const std::string& kernel_name,
     std::function<void(CUfunction)> configure_kernel) {
   auto it = kernels_.find(kernel_name);
@@ -369,14 +404,22 @@ CUfunction JitModule::get_kernel(
 
   // If it is the first time we run this kernel then configure it. Do it only
   // once!
-  if (!it->second.second) {
+  auto kernel = std::get<0>(it->second);
+  if (!std::get<1>(it->second)) {
     if (configure_kernel) {
-      configure_kernel(it->second.first);
+      configure_kernel(kernel);
     }
-    it->second.second = true;
+    std::get<1>(it->second) = true;
+    std::get<2>(it->second) = max_occupancy_block_dim(kernel);
   }
 
-  return it->second.first;
+  return {kernel, std::get<2>(it->second)};
+}
+
+CUfunction JitModule::get_kernel(
+    const std::string& kernel_name,
+    std::function<void(CUfunction)> configure_kernel) {
+  return get_kernel_and_dims(kernel_name, std::move(configure_kernel)).first;
 }
 
 std::unordered_map<std::string, JitModule>& get_jit_module_cache() {

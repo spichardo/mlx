@@ -389,19 +389,22 @@ auto py_vmap(
   };
 }
 
-std::unordered_map<std::uintptr_t, nb::object>& tree_cache() {
-  // This map is used to Cache the tree structure of the outputs
-  static std::unordered_map<std::uintptr_t, nb::object> tree_cache_;
-  return tree_cache_;
-}
-
 struct PyCompiledFun {
   nb::callable fun;
   std::uintptr_t fun_id;
   nb::object captured_inputs;
   nb::object captured_outputs;
   bool shapeless;
-  mutable size_t num_outputs{0};
+
+  // Data to attach to the compiled function that contains the python output
+  // structure and the number of arrays in said structure.
+  struct AttachedData {
+    nb::object output_structure;
+    int num_outputs;
+
+    AttachedData(nb::object output_structure_, int num_outputs_)
+        : output_structure(output_structure_), num_outputs(num_outputs_) {}
+  };
 
   PyCompiledFun(
       const nb::callable& fun,
@@ -424,7 +427,6 @@ struct PyCompiledFun {
     captured_inputs = std::move(other.captured_inputs);
     captured_outputs = std::move(other.captured_outputs);
     shapeless = other.shapeless;
-    num_outputs = other.num_outputs;
   };
 
   nb::object call_impl(const nb::args& args, const nb::kwargs& kwargs) {
@@ -441,6 +443,7 @@ struct PyCompiledFun {
     constexpr uint64_t array_identifier = 18446744073709551557UL;
     constexpr uint64_t list_identifier = 18446744073709551533UL;
     constexpr uint64_t dict_identifier = 18446744073709551521UL;
+    constexpr uint64_t none_identifier = 10239356951478402889UL;
 
     // Flatten the tree with hashed constants and structure
     std::function<void(nb::handle)> recurse;
@@ -476,10 +479,12 @@ struct PyCompiledFun {
       } else if (nb::isinstance<nb::float_>(obj)) {
         auto r = nb::cast<double>(obj);
         constants.push_back(*reinterpret_cast<uint64_t*>(&r));
+      } else if (obj.is_none()) {
+        constants.push_back(none_identifier);
       } else {
         std::ostringstream msg;
         msg << "[compile] Function arguments must be trees of arrays "
-            << "or constants (floats, ints, or strings), but received "
+            << "or constants (floats, ints, strings, or None), but received "
             << "type " << type_name_str(obj) << ".";
         throw std::invalid_argument(msg.str());
       }
@@ -505,9 +510,9 @@ struct PyCompiledFun {
       auto [outputs, py_outputs] =
           tree_flatten_with_structure(std::move(tree_outputs), false);
 
-      tree_cache().insert({fun_id, py_outputs});
+      std::shared_ptr<void> extra_data =
+          std::make_shared<AttachedData>(py_outputs, outputs.size());
 
-      num_outputs = outputs.size();
       if (!captured_outputs.is_none()) {
         auto flat_out_captures = tree_flatten(captured_outputs, false);
         outputs.insert(
@@ -520,7 +525,7 @@ struct PyCompiledFun {
       if (!captured_inputs.is_none()) {
         tree_replace(captured_inputs, trace_captures, flat_in_captures);
       }
-      return outputs;
+      return mx::detail::ArraysAndExtra{outputs, extra_data};
     };
 
     if (!captured_inputs.is_none()) {
@@ -532,8 +537,14 @@ struct PyCompiledFun {
     }
 
     // Compile and call
-    auto outputs =
+    auto [outputs, extra_data] =
         mx::detail::compile(compile_fun, fun_id, shapeless, constants)(inputs);
+
+    int num_outputs =
+        reinterpret_cast<AttachedData*>(extra_data.get())->num_outputs;
+    nb::object py_outputs =
+        reinterpret_cast<AttachedData*>(extra_data.get())->output_structure;
+
     if (!captured_outputs.is_none()) {
       std::vector<mx::array> captures(
           std::make_move_iterator(outputs.begin() + num_outputs),
@@ -542,8 +553,7 @@ struct PyCompiledFun {
     }
 
     // Put the outputs back in the container
-    nb::object py_outputs = tree_cache().at(fun_id);
-    return tree_unflatten_from_structure(py_outputs, outputs);
+    return tree_unflatten_from_structure(std::move(py_outputs), outputs);
   }
 
   nb::object operator()(const nb::args& args, const nb::kwargs& kwargs) const {
@@ -553,7 +563,6 @@ struct PyCompiledFun {
   ~PyCompiledFun() {
     nb::gil_scoped_acquire gil;
 
-    tree_cache().erase(fun_id);
     mx::detail::compile_erase(fun_id);
     fun.reset();
     captured_inputs.reset();
@@ -1476,8 +1485,6 @@ void init_transforms(nb::module_& m) {
 
   // Register static Python object cleanup before the interpreter exits
   auto atexit = nb::module_::import_("atexit");
-  atexit.attr("register")(nb::cpp_function([]() {
-    tree_cache().clear();
-    mx::detail::compile_clear_cache();
-  }));
+  atexit.attr("register")(
+      nb::cpp_function([]() { mx::detail::compile_clear_cache(); }));
 }

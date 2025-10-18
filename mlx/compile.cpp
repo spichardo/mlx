@@ -95,6 +95,11 @@ Compiled::Compiled(
   std::ostringstream os;
   std::ostringstream constant_hasher;
 
+  std::unordered_set<uintptr_t> output_ids;
+  for (auto& o : outputs_) {
+    output_ids.insert(o.id());
+  }
+
   // Fill the input names. This is not really necessary, I just like having A,
   // B, C, ... as the inputs.
   for (const auto& x : inputs_) {
@@ -106,6 +111,12 @@ Compiled::Compiled(
   for (const auto& a : tape_) {
     // name and type of output
     os << namer.get_name(a) << kindof(a.dtype()) << a.itemsize();
+    // whether or not it's an output
+    if (output_ids.find(a.id()) != output_ids.end()) {
+      os << "O";
+    } else {
+      os << "I";
+    }
     // computation performed
     os << a.primitive().name();
     // name of inputs to the function
@@ -296,6 +307,7 @@ class CompilerCache {
     std::vector<array> tape;
     bool empty{true};
     std::vector<uint64_t> constants;
+    std::shared_ptr<void> extra;
   };
 
   // Returns a reference to a CacheEntry which can be updated
@@ -376,8 +388,9 @@ CompilerCache& compiler_cache() {
   return compiler_cache_;
 }
 
-std::pair<std::vector<array>, std::vector<array>> compile_trace(
-    const std::function<std::vector<array>(const std::vector<array>&)>& fun,
+std::tuple<std::vector<array>, std::vector<array>, std::shared_ptr<void>>
+compile_trace(
+    const ArrayFnWithExtra& fun,
     const std::vector<array>& inputs,
     bool shapeless) {
   // Set the global tracing flag.
@@ -391,7 +404,9 @@ std::pair<std::vector<array>, std::vector<array>> compile_trace(
     in.set_tracer(true);
     tracer_inputs.push_back(std::move(in));
   }
-  return {tracer_inputs, fun(tracer_inputs)};
+
+  auto output = fun(tracer_inputs);
+  return {tracer_inputs, output.first, output.second};
 }
 
 // Traverses the graph to build a tape and a map of array ids to their parents
@@ -444,6 +459,24 @@ std::pair<std::vector<array>, ParentsMap> compile_dfs(
   }
   return {tape, parents_map};
 }
+
+static inline uint64_t splitmix64(uint64_t x) noexcept {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+
+struct VecU64Hash {
+  size_t operator()(const std::vector<uint64_t>& s) const noexcept {
+    uint64_t h =
+        0x243f6a8885a308d3ull ^ (uint64_t)s.size() * 0x9e3779b97f4a7c15ull;
+    for (uint64_t x : s) {
+      h = splitmix64(x ^ splitmix64(h + 0x9e3779b97f4a7c15ull));
+    }
+    return (size_t)h;
+  }
+};
 
 // Simplify the tape. Note, this function modifies in-place both the tape,
 // the parents map to remove orphaned arrays, and potentially the outputs
@@ -569,29 +602,73 @@ void compile_simplify(
         if (parents != parents_map.end()) {
           auto N = parents->second.size();
           std::vector<bool> mask(N, false);
-          for (int i = 0; i < N; i++) {
-            if (mask[i]) {
-              continue;
+
+          auto try_merge = [&](int dst_idx, int src_idx) {
+            if (tape_order[parents->second[src_idx].first.id()] <
+                tape_order[parents->second[dst_idx].first.id()]) {
+              std::swap(src_idx, dst_idx);
             }
-            for (int j = i + 1; j < N; j++) {
-              if (mask[j]) {
+            auto& src = parents->second[src_idx].first;
+            auto& dst = parents->second[dst_idx].first;
+            if (src.id() != dst.id() && array_equivalent(src, dst) &&
+                output_set.find(src.id()) == output_set.end()) {
+              merge(dst, src, parents_map);
+              mask[src_idx] = true;
+            }
+          };
+
+          if (N > 100) {
+            std::unordered_map<
+                std::vector<uint64_t>,
+                std::vector<int>,
+                VecU64Hash>
+                dst_map;
+            // Find possibly mergeable groups
+            for (int i = 0; i < N; i++) {
+              // Make the hash key
+              std::vector<uint64_t> key;
+              auto& curr = parents->second[i].first;
+              key.reserve(curr.inputs().size() + 2);
+              for (auto& in : curr.inputs()) {
+                key.push_back(in.id());
+              }
+              auto& p = curr.primitive();
+              key.push_back(curr.inputs().size());
+              key.push_back(typeid(p).hash_code());
+              auto it = dst_map.find(key);
+              if (it == dst_map.end()) {
+                bool _;
+                std::tie(it, _) = dst_map.insert({key, std::vector<int>{}});
+              }
+              it->second.push_back(i);
+            }
+            for (auto& [_, group] : dst_map) {
+              for (int i = 0; i < group.size(); ++i) {
+                if (mask[group[i]]) {
+                  continue;
+                }
+                for (int j = i + 1; j < group.size(); ++j) {
+                  if (mask[group[j]]) {
+                    continue;
+                  }
+                  try_merge(group[i], group[j]);
+                }
+              }
+            }
+          } else {
+            for (int i = 0; i < N; ++i) {
+              if (mask[i]) {
                 continue;
               }
-              auto src_idx = j;
-              auto dst_idx = i;
-              if (tape_order[parents->second[src_idx].first.id()] <
-                  tape_order[parents->second[dst_idx].first.id()]) {
-                std::swap(src_idx, dst_idx);
-              }
-              auto& src = parents->second[src_idx].first;
-              auto& dst = parents->second[dst_idx].first;
-              if (src.id() != dst.id() && array_equivalent(src, dst) &&
-                  output_set.find(src.id()) == output_set.end()) {
-                merge(dst, src, parents_map);
-                mask[src_idx] = true;
+              for (int j = i + 1; j < N; ++j) {
+                if (mask[j]) {
+                  continue;
+                }
+                try_merge(i, j);
               }
             }
           }
+
           // Erase orphaned parents so we don't keep fusing with them
           for (int i = N - 1; i >= 0; --i) {
             if (mask[i]) {
@@ -727,7 +804,11 @@ void compile_fuse(
       }
     };
 
-    if (arr.has_primitive()) {
+    // This will be the result of the fused operation so it needs
+    //   a) to not be already computed ie have a primitive
+    //   b) that primitive to not be a broadcast since it will unnecessarily
+    //      cast to a contiguous array potentially blowing up memory
+    if (arr.has_primitive() && !is_broadcast(arr.primitive())) {
       Stream s = arr.primitive().stream();
       recurse(arr, 0, s, arr.shape());
     }
@@ -928,8 +1009,8 @@ bool skip_compile() {
       !(compile_available_for_device(default_device()));
 }
 
-std::function<std::vector<array>(const std::vector<array>&)> compile(
-    std::function<std::vector<array>(const std::vector<array>&)> fun,
+ArrayFnWithExtra compile(
+    ArrayFnWithExtra fun,
     std::uintptr_t fun_id,
     bool shapeless /* = false */,
     std::vector<uint64_t> constants /* = {} */) {
@@ -962,7 +1043,7 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
       // Set the constants
       entry.constants = std::move(constants);
       // Trace to build the graph
-      std::tie(entry.inputs, entry.outputs) =
+      std::tie(entry.inputs, entry.outputs, entry.extra) =
           compile_trace(fun, inputs, shapeless);
 
       // DFS the graph and get a tape, and a map of array id to (parent,
@@ -987,8 +1068,37 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
 
     // At this point we must have a tape, now replace the placeholders
     // with real arrays that can be evaluated
-    return compile_replace(
-        entry.tape, entry.inputs, entry.outputs, inputs, shapeless);
+    return ArraysAndExtra{
+        compile_replace(
+            entry.tape, entry.inputs, entry.outputs, inputs, shapeless),
+        entry.extra};
+  };
+}
+
+std::function<std::vector<array>(const std::vector<array>&)> compile(
+    std::function<std::vector<array>(const std::vector<array>&)> fun,
+    std::uintptr_t fun_id,
+    bool shapeless /* = false */,
+    std::vector<uint64_t> constants /* = {} */) {
+  if (skip_compile()) {
+    return fun;
+  }
+  if (!fun) {
+    throw std::invalid_argument(
+        "[compile] Cannot compile a function without a target.");
+  }
+
+  ArrayFnWithExtra fun_with_extra =
+      [fun = std::move(fun)](const std::vector<array>& inputs) {
+        return ArraysAndExtra{fun(inputs), nullptr};
+      };
+
+  auto compiled_fun = compile(
+      std::move(fun_with_extra), fun_id, shapeless, std::move(constants));
+
+  return [compiled_fun =
+              std::move(compiled_fun)](const std::vector<array>& inputs) {
+    return compiled_fun(inputs).first;
   };
 }
 

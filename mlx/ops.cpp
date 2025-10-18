@@ -348,16 +348,16 @@ array tril(array x, int k /* = 0 */, StreamOrDevice s /* = {} */) {
   if (x.ndim() < 2) {
     throw std::invalid_argument("[tril] array must be at least 2-D");
   }
-  auto mask = tri(x.shape(-2), x.shape(-1), k, x.dtype(), s);
-  return where(mask, x, zeros_like(x, s), s);
+  auto mask = tri(x.shape(-2), x.shape(-1), k, bool_, s);
+  return where(mask, x, array(0, x.dtype()), s);
 }
 
 array triu(array x, int k /* = 0 */, StreamOrDevice s /* = {} */) {
   if (x.ndim() < 2) {
     throw std::invalid_argument("[triu] array must be at least 2-D");
   }
-  auto mask = tri(x.shape(-2), x.shape(-1), k - 1, x.dtype(), s);
-  return where(mask, zeros_like(x, s), x, s);
+  auto mask = tri(x.shape(-2), x.shape(-1), k - 1, bool_, s);
+  return where(mask, array(0, x.dtype()), x, s);
 }
 
 array reshape(const array& a, Shape shape, StreamOrDevice s /* = {} */) {
@@ -1228,14 +1228,14 @@ array pad(
     if (low_pad_size[i] < 0) {
       std::ostringstream msg;
       msg << "Invalid low padding size (" << low_pad_size[i]
-          << ") passed to pad" << " for axis " << i
+          << ") passed to pad for axis " << i
           << ". Padding sizes must be non-negative";
       throw std::invalid_argument(msg.str());
     }
     if (high_pad_size[i] < 0) {
       std::ostringstream msg;
       msg << "Invalid high padding size (" << high_pad_size[i]
-          << ") passed to pad" << " for axis " << i
+          << ") passed to pad for axis " << i
           << ". Padding sizes must be non-negative";
       throw std::invalid_argument(msg.str());
     }
@@ -2859,26 +2859,6 @@ array matmul(
         "have at least one dimension.");
   }
 
-  // complex matmul using Karatsuba's Algorithm
-  if (a.dtype() == complex64 || b.dtype() == complex64) {
-    // Extract real and imaginary parts
-    auto a_real = real(a, s);
-    auto a_imag = imag(a, s);
-    auto b_real = real(b, s);
-    auto b_imag = imag(b, s);
-
-    // Compute real and imaginary components of the result
-    auto m1 = matmul(a_real, b_real, s);
-    auto m2 = matmul(a_imag, b_imag, s);
-    auto m3 = matmul(add(a_real, a_imag, s), add(b_real, b_imag, s), s);
-
-    auto c_real = subtract(m1, m2, s);
-    auto c_imag = subtract(m3, add(m1, m2, s), s);
-
-    return add(
-        c_real, multiply(array(complex64_t{0, 1}, complex64), c_imag, s), s);
-  }
-
   if (a.ndim() == 1) {
     // Insert a singleton dim in the beginning
     a = expand_dims(a, 0, s);
@@ -2898,11 +2878,11 @@ array matmul(
   // Type promotion
   auto out_type = promote_types(a.dtype(), b.dtype());
 
-  if (!issubdtype(out_type, floating)) {
+  if (!issubdtype(out_type, inexact)) {
     std::ostringstream msg;
-    msg << "[matmul] Only real floating point types are supported but "
-        << a.dtype() << " and " << b.dtype() << " were provided which results"
-        << " in " << out_type << ", which is not a real floating point type.";
+    msg << "[matmul] Only inexact types are supported but " << a.dtype()
+        << " and " << b.dtype() << " were provided which results"
+        << " in " << out_type << ", which is not a floating point type.";
     throw std::invalid_argument(msg.str());
   }
   if (a.dtype() != out_type) {
@@ -3146,8 +3126,8 @@ array take_along_axis(
     StreamOrDevice s /* = {} */) {
   if (axis + a.ndim() < 0 || axis >= static_cast<int>(a.ndim())) {
     std::ostringstream msg;
-    msg << "[take_along_axis] Received invalid axis " << " for array with "
-        << a.ndim() << " dimensions.";
+    msg << "[take_along_axis] Received invalid axis for array with " << a.ndim()
+        << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
 
@@ -3184,7 +3164,7 @@ array scatter_axis(
       (mode == ScatterAxis::None) ? "[put_along_axis]" : "[scatter_add_axis]";
   if (axis + a.ndim() < 0 || axis >= static_cast<int>(a.ndim())) {
     std::ostringstream msg;
-    msg << prefix << " Received invalid axis " << " for array with " << a.ndim()
+    msg << prefix << " Received invalid axis for array with " << a.ndim()
         << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
@@ -3488,6 +3468,14 @@ array cumsum(
       {a});
 }
 
+array cumsum(
+    const array& a,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  return cumsum(flatten(a, to_stream(s)), 0, reverse, inclusive, to_stream(s));
+}
+
 array cumprod(
     const array& a,
     int axis,
@@ -3508,6 +3496,14 @@ array cumprod(
       std::make_shared<Scan>(
           to_stream(s), Scan::ReduceType::Prod, axis, reverse, inclusive),
       {a});
+}
+
+array cumprod(
+    const array& a,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  return cumprod(flatten(a, s), 0, reverse, inclusive, s);
 }
 
 array cummax(
@@ -3532,6 +3528,14 @@ array cummax(
       {a});
 }
 
+array cummax(
+    const array& a,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  return cummax(flatten(a, s), 0, reverse, inclusive, s);
+}
+
 array cummin(
     const array& a,
     int axis,
@@ -3552,6 +3556,14 @@ array cummin(
       std::make_shared<Scan>(
           to_stream(s), Scan::ReduceType::Min, axis, reverse, inclusive),
       {a});
+}
+
+array cummin(
+    const array& a,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  return cummin(flatten(a, s), 0, reverse, inclusive, s);
 }
 
 array logcumsumexp(
@@ -3576,113 +3588,18 @@ array logcumsumexp(
       {a});
 }
 
+array logcumsumexp(
+    const array& a,
+    bool reverse /* = false*/,
+    bool inclusive /* = true*/,
+    StreamOrDevice s /* = {}*/) {
+  return logcumsumexp(
+      flatten(a, to_stream(s)), 0, reverse, inclusive, to_stream(s));
+}
+
 /** Convolution operations */
 
 namespace {
-
-// Conv helpers
-inline int conv_out_axis_size(int in_dim, int wt_dim, int stride, int padding) {
-  return ((in_dim + padding - wt_dim) / stride) + 1;
-}
-
-// Conv helpers
-inline int dilate_size(int dim, int dil) {
-  return 1 + dil * (dim - 1);
-}
-
-Shape conv_out_shape(
-    const Shape& in_shape,
-    const Shape& wt_shape,
-    const std::vector<int>& strides,
-    const std::vector<int>& pads_lo,
-    const std::vector<int>& pads_hi,
-    const std::vector<int>& kernel_dilation,
-    const std::vector<int>& input_dilation) {
-  int N = in_shape[0];
-  int O = wt_shape[0];
-  Shape out_shape(in_shape.size());
-  int i = 0;
-  out_shape[i++] = N;
-
-  int spatial_dims = in_shape.size() - 2;
-
-  if (strides.size() != spatial_dims) {
-    std::ostringstream msg;
-    msg << "[conv] Invalid strides " << strides << " for " << spatial_dims
-        << "D convolution.";
-    throw std::invalid_argument(msg.str());
-  }
-
-  if (pads_lo.size() != spatial_dims || pads_hi.size() != spatial_dims) {
-    std::ostringstream msg;
-    msg << "[conv] Invalid padding " << pads_lo << " | " << pads_hi << " for "
-        << spatial_dims << "D convolution.";
-    throw std::invalid_argument(msg.str());
-  }
-
-  if (kernel_dilation.size() != spatial_dims) {
-    std::ostringstream msg;
-    msg << "[conv] Invalid kernel dilation " << kernel_dilation << " for "
-        << spatial_dims << "D convolution.";
-    throw std::invalid_argument(msg.str());
-  }
-
-  if (input_dilation.size() != spatial_dims) {
-    std::ostringstream msg;
-    msg << "[conv] Invalid input dilation " << input_dilation << " for "
-        << spatial_dims << "D convolution.";
-    throw std::invalid_argument(msg.str());
-  }
-
-  for (; i < in_shape.size() - 1; i++) {
-    if (kernel_dilation[i - 1] <= 0) {
-      std::ostringstream msg;
-      msg << "[conv] Kernel dilation sizes must be positive."
-          << " Got kernel dilation " << kernel_dilation << ".";
-      throw std::invalid_argument(msg.str());
-    }
-
-    if (input_dilation[i - 1] <= 0) {
-      std::ostringstream msg;
-      msg << "[conv] Input dilation sizes must be positive."
-          << " Got input dilation " << input_dilation << ".";
-      throw std::invalid_argument(msg.str());
-    }
-
-    if (pads_lo[i - 1] < 0 || pads_hi[i - 1] < 0) {
-      std::ostringstream msg;
-      msg << "[conv] Padding sizes must be non-negative." << " Got padding "
-          << pads_lo << " | " << pads_hi << ".";
-      throw std::invalid_argument(msg.str());
-    }
-
-    if (strides[i - 1] <= 0) {
-      std::ostringstream msg;
-      msg << "[conv] Stride sizes must be positive." << " Got strides "
-          << strides << ".";
-      throw std::invalid_argument(msg.str());
-    }
-
-    int kd = dilate_size(wt_shape[i], kernel_dilation[i - 1]);
-    int id = dilate_size(in_shape[i], input_dilation[i - 1]);
-
-    out_shape[i] = conv_out_axis_size(
-        id, kd, strides[i - 1], pads_lo[i - 1] + pads_hi[i - 1]);
-
-    if (out_shape[i] <= 0) {
-      std::ostringstream msg;
-      msg << "[conv] Spatial dimensions of input after padding"
-          << " cannot be smaller than weight spatial dimensions."
-          << " Got error at axis " << i << " for input with shape " << in_shape
-          << ", padding low " << pads_lo << ", padding high " << pads_hi
-          << ", and weight of shape " << wt_shape << ".";
-      throw std::invalid_argument(msg.str());
-    }
-  }
-  out_shape[i] = O;
-
-  return out_shape;
-}
 
 inline void
 run_conv_checks(const array& in, const array& wt, int n_dim, int groups) {
@@ -3696,7 +3613,7 @@ run_conv_checks(const array& in, const array& wt, int n_dim, int groups) {
   if (in.ndim() != n_dim + 2) {
     std::ostringstream msg;
     msg << "[conv] Invalid input array with " << in.ndim() << " dimensions for "
-        << n_dim << "D convolution." << " Expected an array with " << n_dim + 2
+        << n_dim << "D convolution. Expected an array with " << n_dim + 2
         << " dimensions following the format [N, ..., C_in].";
     throw std::invalid_argument(msg.str());
   }
@@ -3997,7 +3914,7 @@ array conv_general(
   }
 
   // Get output shapes
-  auto out_shape = conv_out_shape(
+  auto out_shape = Convolution::conv_out_shape(
       in.shape(),
       wt.shape(),
       stride,
@@ -4245,7 +4162,8 @@ std::vector<array> quantize(
     std::ostringstream msg;
     msg << "[quantize] The last dimension of the matrix needs to be divisible by "
         << "the quantization group size " << group_size
-        << ". However the provided " << " matrix has shape " << w.shape();
+        << ". However the provided "
+        << " matrix has shape " << w.shape();
     throw std::invalid_argument(msg.str());
   }
 

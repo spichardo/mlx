@@ -14,10 +14,6 @@ namespace mlx::core::cu {
 
 namespace {
 
-// Can be tuned with MLX_MAX_OPS_PER_BUFFER
-// This should be less than 255
-constexpr int default_max_nodes_per_graph = 20;
-
 #define CHECK_CUDNN_ERROR(cmd) check_cudnn_error(#cmd, (cmd))
 
 void check_cudnn_error(const char* name, cudnnStatus_t err) {
@@ -25,13 +21,6 @@ void check_cudnn_error(const char* name, cudnnStatus_t err) {
     throw std::runtime_error(
         fmt::format("{} failed: {}.", name, cudnnGetErrorString(err)));
   }
-}
-
-int cuda_graph_cache_size() {
-  static int cache_size = []() {
-    return env::get_var("MLX_CUDA_GRAPH_CACHE_SIZE", 400);
-  }();
-  return cache_size;
 }
 
 bool use_cuda_graphs() {
@@ -75,8 +64,8 @@ Device::~Device() {
 
 void Device::make_current() {
   // We need to set/get current CUDA device very frequently, cache it to reduce
-  // actual calls of CUDA APIs. This function assumes single-thread in host.
-  static int current = 0;
+  // actual calls of CUDA APIs.
+  static thread_local int current = 0;
   if (current != device_) {
     CHECK_CUDA_ERROR(cudaSetDevice(device_));
     current = device_;
@@ -102,6 +91,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 
 CommandEncoder::CaptureContext::~CaptureContext() {
   if (!use_cuda_graphs()) {
+    enc.node_count_++;
     return;
   }
 
@@ -203,7 +193,8 @@ CommandEncoder::CommandEncoder(Device& d)
     : device_(d),
       stream_(d),
       graph_(d),
-      graph_cache_(cuda_graph_cache_size()) {}
+      worker_(d),
+      graph_cache_("MLX_CUDA_GRAPH_CACHE_SIZE", /* default_capacity */ 400) {}
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
   worker_.add_task(std::move(task));
@@ -227,12 +218,6 @@ void CommandEncoder::set_output_array(const array& arr) {
   active_outputs_.push_back(id);
 }
 
-void CommandEncoder::maybe_commit() {
-  if (node_count_ >= env::max_ops_per_buffer(default_max_nodes_per_graph)) {
-    commit();
-  }
-}
-
 void CommandEncoder::add_kernel_node(
     void* func,
     dim3 grid_dim,
@@ -240,6 +225,7 @@ void CommandEncoder::add_kernel_node(
     uint32_t smem_bytes,
     void** params) {
   if (!use_cuda_graphs()) {
+    node_count_++;
     CHECK_CUDA_ERROR(cudaLaunchKernel(
         func, grid_dim, block_dim, params, smem_bytes, stream()));
     return;
@@ -260,6 +246,7 @@ void CommandEncoder::add_kernel_node(
     uint32_t smem_bytes,
     void** params) {
   if (!use_cuda_graphs()) {
+    node_count_++;
     CHECK_CUDA_ERROR(cuLaunchKernel(
         func,
         grid_dim.x,
@@ -302,14 +289,20 @@ void CommandEncoder::add_kernel_node(const CUDA_KERNEL_NODE_PARAMS& params) {
 
 void CommandEncoder::add_graph_node(cudaGraph_t child) {
   if (!use_cuda_graphs()) {
+    node_count_++;
     CudaGraphExec graph_exec;
     graph_exec.instantiate(child);
     device_.make_current();
     CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream()));
+    return;
   }
   cudaGraphNode_t node;
   CHECK_CUDA_ERROR(cudaGraphAddChildGraphNode(&node, graph_, NULL, 0, child));
   insert_graph_dependencies(GraphNode{node, 'G'});
+}
+
+int CommandEncoder::get_num_ops() {
+  return node_count_;
 }
 
 void CommandEncoder::commit() {
@@ -317,7 +310,7 @@ void CommandEncoder::commit() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
-  if (node_count_ > 0) {
+  if (use_cuda_graphs() && node_count_ > 0) {
     if (!from_nodes_.empty()) {
       CHECK_CUDA_ERROR(cudaGraphAddDependencies(
           graph_,
@@ -360,7 +353,6 @@ void CommandEncoder::commit() {
     CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
 
     // Reset state
-    node_count_ = 0;
     graph_node_count_ = 0;
     empty_node_count_ = 0;
     from_nodes_.clear();
@@ -372,6 +364,7 @@ void CommandEncoder::commit() {
 
   // Put completion handlers in a batch.
   worker_.commit(stream_);
+  node_count_ = 0;
 }
 
 void CommandEncoder::synchronize() {
