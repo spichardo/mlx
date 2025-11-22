@@ -16,12 +16,11 @@ silicon computer is
 To install from PyPI your system must meet the following requirements:
 
 - Using an M series chip (Apple silicon)
-- Using a native Python >= 3.9
-- macOS >= 13.5
+- Using a native Python >= 3.10
+- macOS >= 14.0
 
 .. note::
-    MLX is only available on devices running macOS >= 13.5
-    It is highly recommended to use macOS 14 (Sonoma)
+    MLX is only available on devices running macOS >= 14.0 and higher.
 
 CUDA
 ^^^^
@@ -39,7 +38,7 @@ requirements:
 - Nvidia driver >= 550.54.14
 - CUDA toolkit >= 12.0
 - Linux distribution with glibc >= 2.35
-- Python >= 3.9
+- Python >= 3.10
 
 
 CPU-only (Linux)
@@ -55,7 +54,7 @@ To install the CPU-only package from PyPi your system must meet the following
 requirements:
 
 - Linux distribution with glibc >= 2.35
-- Python >= 3.9
+- Python >= 3.10
 
 
 Troubleshooting

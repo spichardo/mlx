@@ -151,10 +151,12 @@ class UnaryPrimitive : public Primitive {
   UnaryPrimitive& operator=(UnaryPrimitive&& other) = delete;
 };
 
-enum class QuantizationMode { Affine, Mxfp4 };
+enum class QuantizationMode { Affine, Mxfp4, Mxfp8, Nvfp4 };
 
 std::string quantization_mode_to_string(QuantizationMode mode);
-QuantizationMode string_to_quantization_mode(const std::string& mode);
+QuantizationMode string_to_quantization_mode(
+    const std::string& mode,
+    std::string_view error_tag = "");
 
 class Abs : public UnaryPrimitive {
  public:
@@ -1144,6 +1146,7 @@ class Full : public UnaryPrimitive {
   DEFINE_GRADS()
   DEFINE_NAME(Full)
   DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
 };
 
 class Gather : public UnaryPrimitive {
@@ -1923,6 +1926,20 @@ class ScatterAxis : public UnaryPrimitive {
  private:
   ReduceType reduce_type_;
   int axis_;
+};
+
+class MaskedScatter : public UnaryPrimitive {
+ public:
+  explicit MaskedScatter(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP();
+  DEFINE_GRADS();
+  DEFINE_NAME(MaskedScatter);
+  DEFINE_DEFAULT_IS_EQUIVALENT();
+  DEFINE_INPUT_OUTPUT_SHAPE();
 };
 
 class Sigmoid : public UnaryPrimitive {

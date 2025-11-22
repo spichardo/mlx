@@ -13,6 +13,7 @@
 #include <windows.h>
 #endif // _WIN32
 
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -226,10 +227,7 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
     throw std::runtime_error("[load] Failed to open " + in_stream->label());
   }
 
-  auto stream = to_stream(s, Device::cpu);
-  if (stream.device != Device::cpu) {
-    throw std::runtime_error("[load] Must run on a CPU stream.");
-  }
+  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
 
   ////////////////////////////////////////////////////////
   // Read header and prepare array details
@@ -265,7 +263,7 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   std::vector<char> buffer(header_len + 1);
   in_stream->read(&buffer[0], header_len);
   buffer[header_len] = 0;
-  std::string header(&buffer[0]);
+  std::string header(buffer.data(), header_len);
 
   // Read data type from header
   std::string dtype_str = header.substr(11, 3);
@@ -273,7 +271,7 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   Dtype dtype = dtype_from_array_protocol(dtype_str);
 
   // Read contiguity order
-  bool col_contiguous = header[34] == 'T';
+  bool col_contiguous = header.at(34) == 'T';
 
   // Read array shape from header
   Shape shape;

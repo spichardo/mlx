@@ -482,6 +482,28 @@ class TestCompile(mlx_tests.MLXTestCase):
 
         self.assertEqual(mx.compile(fun, shapeless=True)(x).shape, (1, 32))
 
+    def test_shapeless_compile_full_like(self):
+        x_shape = (1, 1, 32)
+        x = mx.zeros((x_shape))
+
+        def zeros_fun(x):
+            return mx.zeros_like(x)
+
+        def ones_fun(x):
+            return mx.ones_like(x)
+
+        compiled_zero_like = mx.compile(zeros_fun, shapeless=True)
+        compiled_ones_like = mx.compile(ones_fun, shapeless=True)
+
+        self.assertEqual(compiled_zero_like(x).shape, x_shape)
+        self.assertEqual(compiled_ones_like(x).shape, x_shape)
+
+        y_shape = (2, 2, 16)
+        y = mx.zeros(y_shape)
+
+        self.assertEqual(compiled_zero_like(y).shape, y_shape)
+        self.assertEqual(compiled_ones_like(y).shape, y_shape)
+
     def test_compile_with_constant(self):
         # Test float
         @partial(mx.compile)
@@ -842,7 +864,6 @@ class TestCompile(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(out, expected))
 
     def test_compile_many_outputs(self):
-
         @mx.compile
         def fun(arr):
             arrs = [arr] * 64
@@ -1133,6 +1154,30 @@ class TestCompile(mlx_tests.MLXTestCase):
 
         a = fun2(mx.array(-1.0))
         self.assertEqual(a.item(), 1.0)
+
+    def test_multiple_compile_same_capture(self):
+        def fun(do_compile):
+            t = mx.ones((10,))
+            u = (1.0 - t) * 0.0 + t * 3.0
+
+            o = mx.ones((6,))
+            b = o[:, None] * u
+
+            c = b * mx.ones_like(u)
+
+            a = mx.ones((6,))
+            if do_compile:
+                d = mx.compile(lambda x: x @ b)(a)
+                e = mx.compile(lambda x: x @ c.T)(d)
+            else:
+                d = a @ b
+                e = d @ c.T
+            return e
+
+        out = fun(True)
+        mx.eval(out)
+        expected = fun(False)
+        self.assertTrue(mx.allclose(out, expected))
 
 
 if __name__ == "__main__":

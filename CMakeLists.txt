@@ -74,6 +74,7 @@ endif()
 if(MLX_USE_CCACHE)
   find_program(CCACHE_PROGRAM ccache)
   if(CCACHE_PROGRAM)
+    message(STATUS "Found CCache: ${CCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
@@ -87,6 +88,11 @@ include(FetchContent)
 cmake_policy(SET CMP0135 NEW)
 
 add_library(mlx)
+
+# Supress warnings: note: parameter passing for argument of type
+# ‘std::pair<float, float>’ when C++17 is enabled changed to match C++14 in GCC
+# 10.1
+target_compile_options(mlx PRIVATE -Wno-psabi)
 
 if(MLX_BUILD_CUDA)
   enable_language(CUDA)
@@ -122,9 +128,12 @@ if(MLX_BUILD_METAL)
   message(STATUS "Building with macOS SDK version ${MACOS_SDK_VERSION}")
 
   set(METAL_CPP_URL
-      https://developer.apple.com/metal/cpp/files/metal-cpp_macOS15_iOS18.zip)
+      https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip)
 
   if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+    if(${CMAKE_OSX_DEPLOYMENT_TARGET} LESS 14.0)
+      message(FATAL_ERROR "MLX requires macOS >= 14.0")
+    endif()
     set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif()
   execute_process(
@@ -133,7 +142,6 @@ if(MLX_BUILD_METAL)
       "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1 | tr -d '\n'"
     OUTPUT_VARIABLE MLX_METAL_VERSION COMMAND_ERROR_IS_FATAL ANY)
   FetchContent_Declare(metal_cpp URL ${METAL_CPP_URL})
-
   FetchContent_MakeAvailable(metal_cpp)
   target_include_directories(
     mlx PUBLIC $<BUILD_INTERFACE:${metal_cpp_SOURCE_DIR}>

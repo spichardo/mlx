@@ -1,15 +1,22 @@
 set(BASE_HEADERS
-    metal_3_1/bf16.h
-    metal_3_0/bf16.h
+    bf16.h
     bf16_math.h
     complex.h
     defines.h
     erf.h
     expm1f.h
+    fp8.h
     utils.h)
 
 function(build_kernel_base TARGET SRCFILE DEPS)
-  set(METAL_FLAGS -Wall -Wextra -fno-fast-math -Wno-c++17-extensions)
+  set(METAL_FLAGS
+      -x
+      metal
+      -Wall
+      -Wextra
+      -fno-fast-math
+      -Wno-c++17-extensions
+      -Wno-c++20-extensions)
   if(MLX_METAL_DEBUG)
     set(METAL_FLAGS ${METAL_FLAGS} -gline-tables-only -frecord-sources)
   endif()
@@ -17,16 +24,9 @@ function(build_kernel_base TARGET SRCFILE DEPS)
     set(METAL_FLAGS ${METAL_FLAGS}
                     "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif()
-  if(MLX_METAL_VERSION GREATER_EQUAL 310)
-    set(VERSION_INCLUDES
-        ${PROJECT_SOURCE_DIR}/mlx/backend/metal/kernels/metal_3_1)
-  else()
-    set(VERSION_INCLUDES
-        ${PROJECT_SOURCE_DIR}/mlx/backend/metal/kernels/metal_3_0)
-  endif()
   add_custom_command(
     COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
-            -I${PROJECT_SOURCE_DIR} -I${VERSION_INCLUDES} -o ${TARGET}.air
+            -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
     OUTPUT ${TARGET}.air
     COMMENT "Building ${TARGET}.air"
@@ -109,7 +109,8 @@ if(NOT MLX_METAL_JIT)
     reduction/reduce_col.h
     reduction/reduce_row.h)
   build_kernel(quantized quantized.h quantized_utils.h ${STEEL_HEADERS})
-  build_kernel(fp4_quantized fp4_quantized.h quantized_utils.h ${STEEL_HEADERS})
+  build_kernel(fp_quantized fp4.h fp_quantized.h quantized_utils.h
+               ${STEEL_HEADERS})
   build_kernel(scan scan.h)
   build_kernel(softmax softmax.h)
   build_kernel(logsumexp logsumexp.h)
@@ -124,6 +125,30 @@ if(NOT MLX_METAL_JIT)
   build_kernel(steel/gemm/kernels/steel_gemm_splitk ${STEEL_HEADERS})
   build_kernel(steel/gemm/kernels/steel_gemm_segmented ${STEEL_HEADERS})
   build_kernel(gemv_masked steel/utils.h)
+endif()
+
+if((MLX_METAL_VERSION GREATER_EQUAL 400) AND (MACOS_SDK_VERSION GREATER_EQUAL
+                                              26.2))
+  set(STEEL_NAX_HEADERS
+      steel/defines.h
+      steel/utils.h
+      steel/gemm/transforms.h
+      steel/gemm/nax.h
+      steel/gemm/gemm_nax.h
+      steel/utils/type_traits.h
+      steel/utils/integral_constant.h)
+
+  build_kernel(steel/gemm/kernels/steel_gemm_fused_nax ${STEEL_NAX_HEADERS})
+  build_kernel(steel/gemm/kernels/steel_gemm_gather_nax ${STEEL_NAX_HEADERS})
+
+  build_kernel(quantized_nax quantized_nax.h ${STEEL_NAX_HEADERS})
+  build_kernel(fp_quantized_nax fp_quantized_nax.h ${STEEL_NAX_HEADERS})
+
+  set(STEEL_NAX_ATTN_HEADERS
+      steel/defines.h steel/utils.h steel/attn/nax.h steel/utils/type_traits.h
+      steel/utils/integral_constant.h)
+
+  build_kernel(steel/attn/kernels/steel_attention_nax ${STEEL_NAX_ATTN_HEADERS})
 endif()
 
 add_custom_command(

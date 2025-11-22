@@ -11,6 +11,7 @@ const char* ternary_ops();
 const char* reduce_utils();
 const char* gather();
 const char* scatter();
+const char* masked_scatter();
 
 const char* arange();
 const char* unary();
@@ -24,7 +25,7 @@ const char* hadamard();
 const char* logsumexp();
 const char* quantized_utils();
 const char* quantized();
-const char* fp4_quantized();
+const char* fp_quantized();
 const char* ternary();
 const char* scan();
 const char* scatter_axis();

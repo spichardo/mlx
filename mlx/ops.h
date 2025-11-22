@@ -69,6 +69,17 @@ array full(Shape shape, T val, StreamOrDevice s = {}) {
   return full(std::move(shape), array(val), to_stream(s));
 }
 
+array full_like(const array& a, array vals, Dtype dtype, StreamOrDevice s = {});
+array full_like(const array& a, array vals, StreamOrDevice s = {});
+template <typename T>
+array full_like(const array& a, T val, Dtype dtype, StreamOrDevice s = {}) {
+  return full_like(a, array(val, dtype), dtype, to_stream(s));
+}
+template <typename T>
+array full_like(const array& a, T val, StreamOrDevice s = {}) {
+  return full_like(a, array(val, a.dtype()), to_stream(s));
+}
+
 /** Fill an array of the given shape with zeros. */
 array zeros(const Shape& shape, Dtype dtype, StreamOrDevice s = {});
 inline array zeros(const Shape& shape, StreamOrDevice s = {}) {
@@ -534,6 +545,26 @@ array mean(
 
 /** Computes the mean of the elements of an array along the given axis */
 array mean(
+    const array& a,
+    int axis,
+    bool keepdims = false,
+    StreamOrDevice s = {});
+
+/** Computes the median of the elements of an array. */
+array median(const array& a, bool keepdims, StreamOrDevice s = {});
+inline array median(const array& a, StreamOrDevice s = {}) {
+  return median(a, false, to_stream(s));
+}
+
+/** Computes the median of the elements of an array along the given axes */
+array median(
+    const array& a,
+    const std::vector<int>& axes,
+    bool keepdims = false,
+    StreamOrDevice s = {});
+
+/** Computes the median of the elements of an array along the given axis */
+array median(
     const array& a,
     int axis,
     bool keepdims = false,
@@ -1167,6 +1198,12 @@ inline array scatter_min(
   return scatter_min(a, {indices}, updates, std::vector<int>{axis}, s);
 }
 
+array masked_scatter(
+    const array& a,
+    const array& mask,
+    const array& src,
+    StreamOrDevice s = {});
+
 /** Square root the elements of an array. */
 array sqrt(const array& a, StreamOrDevice s = {});
 
@@ -1359,16 +1396,16 @@ array quantized_matmul(
     array scales,
     std::optional<array> biases = std::nullopt,
     bool transpose = true,
-    int group_size = 64,
-    int bits = 4,
+    std::optional<int> group_size = std::nullopt,
+    std::optional<int> bits = std::nullopt,
     const std::string& mode = "affine",
     StreamOrDevice s = {});
 
 /** Quantize a matrix along its last axis */
 std::vector<array> quantize(
     const array& w,
-    int group_size = 64,
-    int bits = 4,
+    std::optional<int> group_size = std::nullopt,
+    std::optional<int> bits = std::nullopt,
     const std::string& mode = "affine",
     StreamOrDevice s = {});
 
@@ -1377,10 +1414,17 @@ array dequantize(
     const array& w,
     const array& scales,
     const std::optional<array>& biases = std::nullopt,
-    int group_size = 64,
-    int bits = 4,
+    std::optional<int> group_size = std::nullopt,
+    std::optional<int> bits = std::nullopt,
     const std::string& mode = "affine",
+    std::optional<Dtype> dtype = std::nullopt,
     StreamOrDevice s = {});
+
+/** Convert an E4M3 float8 to the given floating point dtype. */
+array from_fp8(array x, Dtype dtype, StreamOrDevice s = {});
+
+/** Convert a floating point matrix to E4M3 float8. */
+array to_fp8(array x, StreamOrDevice s = {});
 
 /** Compute matrix products with matrix-level gather. */
 array gather_qmm(
@@ -1391,8 +1435,8 @@ array gather_qmm(
     std::optional<array> lhs_indices = std::nullopt,
     std::optional<array> rhs_indices = std::nullopt,
     bool transpose = true,
-    int group_size = 64,
-    int bits = 4,
+    std::optional<int> group_size = std::nullopt,
+    std::optional<int> bits = std::nullopt,
     const std::string& mode = "affine",
     bool sorted_indices = false,
     StreamOrDevice s = {});

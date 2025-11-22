@@ -1,0 +1,85 @@
+name: 'Setup Linux Environment'
+description: 'Install dependencies for Linux builds'
+
+inputs:
+  toolkit:
+    description: 'Which toolkit to install'
+    required: false
+    default: 'cpu'
+  python-version:
+    description: 'Version of python to set up'
+    required: false
+    default: '3.10'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Use ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.toolkit }}-py${{ inputs.python-version }}
+        max-size: 1GB
+
+    - name: Install common dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev zip
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Setup Python venv
+      shell: bash
+      run: |
+        python -m venv .venv
+        source .venv/bin/activate
+        pip install setuptools cmake nanobind==2.4.0
+        echo PATH=$PATH >> $GITHUB_ENV
+        # Make cmake search .venv for nanobind
+        echo PYTHONPATH=`python -c 'import sys; print(sys.path[-1])'` >> $GITHUB_ENV
+
+    - name: Install MPI
+      shell: bash
+      run: sudo apt-get install -y openmpi-bin openmpi-common libopenmpi-dev
+
+    - name: Install CUDA toolkit
+      if: ${{ startsWith(inputs.toolkit, 'cuda') }}
+      shell: bash
+      env:
+        # Note: the CI machine does not meet CUDA 13's driver requirement.
+        # Compatibility matrix:
+        # https://docs.nvidia.com/deeplearning/cudnn/backend/latest/reference/support-matrix.html
+        # The `nvcc` is installed into `/usr/local/cuda-VERSION/bin/nvcc` - but
+        # it's *not* on the default toolkit path.
+        PACKAGES: |
+          {
+            "cuda-12.6": "libcudnn9-dev-cuda-12 cuda-toolkit-12-6",
+            "cuda-12.9": "libcudnn9-dev-cuda-12 cuda-toolkit-12-9",
+            "cuda-13.0": "libcudnn9-dev-cuda-13 cuda-toolkit-13-0"
+          }
+      run: |
+        export ARCH=${{ runner.arch == 'arm64' && 'arm64' || 'x86_64' }}
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$ARCH/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update
+        sudo apt-get install -y \
+            libnccl2 libnccl-dev \
+            ${{ fromJson(env.PACKAGES)[inputs.toolkit] }}
+
+    - name: CUDA packages and driver report
+      if: ${{ startsWith(inputs.toolkit, 'cuda') }}
+      shell: bash
+      run: |
+        sudo apt-get install -y ubuntu-drivers-common dkms
+        echo "NVIDIA Driver Packages Available:"
+        sudo ubuntu-drivers list --gpgpu
+        echo "NVIDIA Driver Version:"
+        cat /proc/driver/nvidia/version || echo "nvidia driver not found"
+        echo "Installed NVIDIA and CUDA packages:"
+        dpkg -l | egrep "cuda|nvidia" -i
+        echo "DKMS Status:"
+        dkms status || echo "dkms not found"
+        echo "NVIDIA-SMI Status:"
+        nvidia-smi || echo "nvidia-smi not found"
