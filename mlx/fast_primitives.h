@@ -409,7 +409,8 @@ class CustomKernel : public Primitive {
         init_value_,
         scalar_arguments_,
         is_precompiled_,
-        shared_memory_);
+        shared_memory_,
+        use_optimal_threadgroups_);
   }
 
  private:
