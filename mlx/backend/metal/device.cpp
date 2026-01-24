@@ -527,7 +527,7 @@ MTL::Library* Device::build_library_(const std::string& source_string) {
 
   NS::Error* error = nullptr;
   auto options = MTL::CompileOptions::alloc()->init();
-  options->setFastMathEnabled(false);
+  options->setFastMathEnabled(true);
   options->setLanguageVersion(get_metal_version());
   auto mtl_lib = device_->newLibrary(ns_code, options, &error);
   options->release();

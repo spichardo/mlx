@@ -74,8 +74,7 @@ std::string write_signature(
     const auto& arr = inputs[i];
     const auto& rw = input_rw_status[i];
     auto dtype = get_type_string(arr.dtype());
-    std::string location =
-        ((arr.size() < max_constant_array_size) && (!rw))  ? "constant" : "device";
+    std::string location = (!rw)  ? "constant" : "device";
     std::string ref = arr.ndim() == 0 ? "&" : "*";
     if (!rw) { //if read-only (default), otherwise read-write
        kernel_source += "  const ";
