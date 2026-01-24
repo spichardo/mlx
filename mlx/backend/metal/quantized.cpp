@@ -33,6 +33,23 @@ auto get_quantized_kernel_wrapped(
   return get_quantized_kernel(d, name, template_def, mode);
 }
 
+template <typename... Args>
+auto get_qmm_nax_kernel_wrapped(
+    metal::Device& d,
+    const std::string& name,
+    const std::string& func,
+    const std::string& mode,
+    const std::string& type,
+    int group_size,
+    int bits,
+    Args... args) {
+  std::string template_def;
+  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  template_def = get_template_definition(
+      name, fname, type, group_size, bits, std::forward<Args>(args)...);
+  return get_qmm_nax_kernel(d, name, template_def, mode);
+}
+
 inline array
 ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {
   if (!x.flags().row_contiguous) {
@@ -298,9 +315,10 @@ void qvm_split_k(
   int B = out.size() / M / N;
   B *= split_k;
 
-  int bn = 64;
-  int bk = 32;
-  MTL::Size group_dims = MTL::Size(bk, 2, 1);
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  int bn = std::min(group_size, 32) * num_simdgroups;
+  MTL::Size group_dims = MTL::Size(bk, num_simdgroups, 1);
   MTL::Size grid_dims = MTL::Size(M, N / bn, B);
 
   auto x_shape = x.shape();
@@ -414,9 +432,10 @@ void qvm(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = 64;
-  int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  int bn = std::min(group_size, 32) * num_simdgroups;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   std::string kname;
@@ -504,7 +523,7 @@ void qmm_nax(
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   if (transpose) {
-    kernel = get_quantized_kernel_wrapped(
+    kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
         "qmm_t_nax",
@@ -513,10 +532,27 @@ void qmm_nax(
         group_size,
         bits,
         aligned,
-        batched);
+        batched,
+        bm,
+        bk,
+        bn,
+        wm,
+        wn);
   } else {
-    kernel = get_quantized_kernel_wrapped(
-        d, kname, "qmm_n_nax", mode, type_string, group_size, bits, batched);
+    kernel = get_qmm_nax_kernel_wrapped(
+        d,
+        kname,
+        "qmm_n_nax",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        batched,
+        bm,
+        bk,
+        bn,
+        wm,
+        wn);
   }
   auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -589,7 +625,7 @@ void gather_qmm_nax(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "");
   MTL::ComputePipelineState* kernel;
   if (transpose) {
-    kernel = get_quantized_kernel_wrapped(
+    kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
         "gather_qmm_t_nax_",
@@ -597,19 +633,14 @@ void gather_qmm_nax(
         type_string,
         group_size,
         bits,
-        "_bm",
+        aligned,
         bm,
-        "_bn",
-        bn,
-        "_bk",
         bk,
-        "_wm",
+        bn,
         wm,
-        "_wn",
-        wn,
-        aligned);
+        wn);
   } else {
-    kernel = get_quantized_kernel_wrapped(
+    kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
         "gather_qmm_n_nax_",
@@ -617,15 +648,10 @@ void gather_qmm_nax(
         type_string,
         group_size,
         bits,
-        "_bm",
         bm,
-        "_bn",
-        bn,
-        "_bk",
         bk,
-        "_wm",
+        bn,
         wm,
-        "_wn",
         wn);
   }
 
@@ -920,9 +946,10 @@ void gather_qvm(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = 64;
-  int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  int bn = std::min(group_size, 32) * num_simdgroups;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   std::string kname;
@@ -1053,7 +1080,7 @@ void gather_qmm_rhs_nax(
 
   // Get and set the kernel
   auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = get_gather_qmm_kernel(
+  auto kernel = get_gather_qmm_nax_kernel(
       d,
       kname,
       hash_name,
@@ -1428,25 +1455,26 @@ void fast::Quantize::eval_gpu(
   auto& compute_encoder = d.get_command_encoder(s.index);
 
   auto w = ensure_row_contiguous(w_pre, d, s);
-  compute_encoder.set_input_array(w, 0);
   if (dequantize_) {
     auto scales = ensure_row_contiguous(inputs[1], d, s);
-    compute_encoder.set_input_array(scales, 1);
-    compute_encoder.set_output_array(out, 3);
     if (mode_ == QuantizationMode::Affine) {
       auto biases = ensure_row_contiguous(inputs[2], d, s);
       compute_encoder.set_input_array(biases, 2);
     }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_output_array(out, 3);
   } else {
     auto& scales = outputs[1];
     scales.set_data(allocator::malloc(scales.nbytes()));
-    compute_encoder.set_output_array(out, 1);
-    compute_encoder.set_output_array(scales, 2);
     if (mode_ == QuantizationMode::Affine) {
       auto& biases = outputs[2];
       biases.set_data(allocator::malloc(biases.nbytes()));
       compute_encoder.set_output_array(biases, 3);
     }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_output_array(out, 1);
+    compute_encoder.set_output_array(scales, 2);
   }
 
   auto type_string = dequantize_ ? get_type_string(out.dtype())

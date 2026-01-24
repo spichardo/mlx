@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/distributed/primitives.h"
+#include <cuda_runtime.h>
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 
@@ -23,9 +24,15 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no CUDA implementation.");   \
   }
 
+#if CUDART_VERSION < 12080
+void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  throw std::runtime_error(
+      "[QQMatmul::eval_gpu] QQMM is only supported with CUDA 12.8 or higher.");
+}
+#endif
+
 NO_GPU(BlockMaskedMM)
 NO_GPU(FFT)
-NO_GPU(GatherMM)
 NO_GPU(GatherQMM)
 NO_GPU(Hadamard)
 NO_GPU_MULTI(LUF)

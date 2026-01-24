@@ -4,6 +4,7 @@
 
 #include <unordered_set>
 
+#include "mlx/api.h"
 #include "mlx/array.h"
 #include "mlx/device.h"
 #include "mlx/io/load.h"
@@ -45,7 +46,7 @@
 namespace mlx::core {
 
 // Abstract base class
-class Primitive {
+class MLX_API Primitive {
  public:
   explicit Primitive(Stream stream) : stream_(stream) {}
 
@@ -123,7 +124,7 @@ class Primitive {
   Stream stream_;
 };
 
-class UnaryPrimitive : public Primitive {
+class MLX_API UnaryPrimitive : public Primitive {
   /**
    * An abstract base class for a primitive with a single output.
    */
@@ -349,7 +350,7 @@ class ArgPartition : public UnaryPrimitive {
   int axis_;
 };
 
-class ArgReduce : public UnaryPrimitive {
+class MLX_API ArgReduce : public UnaryPrimitive {
  public:
   enum ReduceType {
     ArgMin,
@@ -1642,6 +1643,36 @@ class QuantizedMatmul : public UnaryPrimitive {
   bool transpose_;
 };
 
+class QQMatmul : public UnaryPrimitive {
+ public:
+  explicit QQMatmul(
+      Stream stream,
+      int group_size,
+      int bits,
+      QuantizationMode mode)
+      : UnaryPrimitive(stream),
+        group_size_(group_size),
+        bits_(bits),
+        mode_(mode) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  // DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_NAME(QQMatmul)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(group_size_, bits_, mode_);
+  }
+
+ private:
+  int group_size_;
+  int bits_;
+  QuantizationMode mode_;
+};
+
 class GatherQMM : public UnaryPrimitive {
  public:
   explicit GatherQMM(
@@ -1751,12 +1782,7 @@ class Reduce : public UnaryPrimitive {
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
 
   DEFINE_VMAP()
-
-  std::vector<array> vjp(
-      const std::vector<array>& primals,
-      const std::vector<array>& cotangents,
-      const std::vector<int>& argnums,
-      const std::vector<array>& outputs) override;
+  DEFINE_GRADS();
 
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
 
@@ -1871,13 +1897,13 @@ class Scatter : public UnaryPrimitive {
   const char* name() const override {
     switch (reduce_type_) {
       case Sum:
-        return "ScatterSum";
+        return "Scatter Sum";
       case Prod:
-        return "ScatterProd";
+        return "Scatter Prod";
       case Min:
-        return "ScatterMin";
+        return "Scatter Min";
       case Max:
-        return "ScatterMax";
+        return "Scatter Max";
       case None:
         return "Scatter";
     }
@@ -1910,7 +1936,7 @@ class ScatterAxis : public UnaryPrimitive {
   const char* name() const override {
     switch (reduce_type_) {
       case Sum:
-        return "ScatterAxisSum";
+        return "ScatterAxis Sum";
       case None:
         return "ScatterAxis";
     }

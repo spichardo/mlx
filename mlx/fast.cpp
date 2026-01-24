@@ -202,17 +202,35 @@ array layer_norm(
            "0 dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (has_weight && (*weight).ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[layer_norm] weight must have 1 dimension but has "
-        << (*weight).ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
+  if (has_weight) {
+    if ((*weight).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[layer_norm] weight must have 1 dimension but has "
+          << (*weight).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*weight).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[layer_norm] weight must have the same size as the last dimension of"
+             " x but has "
+          << (*weight).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
-  if (has_bias && (*bias).ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[layer_norm] bias must have 1 dimension but has " << (*bias).ndim()
-        << " dimensions.";
-    throw std::invalid_argument(msg.str());
+  if (has_bias) {
+    if ((*bias).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[layer_norm] bias must have 1 dimension but has "
+          << (*bias).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*bias).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[layer_norm] bias must have the same size as the last dimension of"
+             " x but has "
+          << (*bias).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
 
   auto out_type = (has_weight)
@@ -800,6 +818,15 @@ array scaled_dot_product_attention(
           is_training,
           output_logsumexp,
           stream)) {
+    if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
+      // Convert bool mask to additive mask.
+      float inf = std::numeric_limits<float>::infinity();
+      array& mask = inputs[3];
+      mask = where(
+          mask,
+          full_like(mask, 0, final_type, s),
+          full_like(mask, -inf, final_type, s));
+    }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
         stream, fallback, scale, do_causal, has_sinks, output_logsumexp);
@@ -839,7 +866,7 @@ std::vector<array> ScaledDotProductAttention::vjp(
 
   std::vector<Shape> shapes;
   std::vector<Dtype> dtypes;
-  for (int i = 0; i < primals.size(); ++i) {
+  for (int i = 0; i < /* outputs size */ 3; ++i) {
     shapes.push_back(primals[i].shape());
     dtypes.push_back(primals[i].dtype());
   }
@@ -853,6 +880,11 @@ std::vector<array> ScaledDotProductAttention::vjp(
 
   std::vector<array> returned_vjps;
   for (int arg : argnums) {
+    if (arg >= 3) {
+      throw std::invalid_argument(
+          "[scale_dot_product_attention] Does not support VJP with respect "
+          " to mask or attention sinks.");
+    }
     returned_vjps.push_back(std::move(vjps[arg]));
   }
   return returned_vjps;

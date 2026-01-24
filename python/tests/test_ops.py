@@ -1242,6 +1242,14 @@ class TestOps(mlx_tests.MLXTestCase):
         out = mx.take(a, mx.array([[1]]), axis=0)
         self.assertEqual(out.shape, (1, 1, 4))
 
+        # Take from empty array works in some cases
+        a = mx.zeros((4, 0))
+        out = mx.take(a, mx.array([1, 2]), axis=0)
+        self.assertEqual(out.shape, (2, 0))
+        self.assertEqual(out.dtype, a.dtype)
+        with self.assertRaises(ValueError):
+            mx.take(a, mx.array([[1]]), axis=1)
+
     def test_take_along_axis(self):
         a_np = np.arange(8).reshape(2, 2, 2)
         a_mlx = mx.array(a_np)
@@ -3197,8 +3205,6 @@ class TestOps(mlx_tests.MLXTestCase):
             )
         )
 
-
-class TestBroadcast(mlx_tests.MLXTestCase):
     def test_broadcast_shapes(self):
         # Basic broadcasting
         self.assertEqual(mx.broadcast_shapes((1, 2, 3), (3,)), (1, 2, 3))
@@ -3242,6 +3248,13 @@ class TestBroadcast(mlx_tests.MLXTestCase):
         expected = mx.array([0.0, 2.0, 3.0, mx.nan])
         self.assertTrue(mx.array_equal(mx.sort(x), expected, equal_nan=True))
         x = mx.array([3.0, mx.nan, 2.0, 0.0]) + 1j * mx.array([1.0] * 4)
+
+    def test_to_from_fp8(self):
+        vals = mx.array(
+            [448, 256, 192, 128, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 0.015625]
+        )
+        self.assertTrue(mx.array_equal(mx.from_fp8(mx.to_fp8(vals)), vals))
+        self.assertTrue(mx.array_equal(mx.from_fp8(mx.to_fp8(-vals)), -vals))
 
 
 if __name__ == "__main__":

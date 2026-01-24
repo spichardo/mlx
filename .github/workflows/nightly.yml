@@ -16,25 +16,26 @@ jobs:
         python_version: ["3.10", "3.14"]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-linux
       - uses: ./.github/actions/build-linux-release
         with:
           build-backend: ${{ matrix.python-version == '3.10' }}
           arch: "x86_64"
       - name: Upload mlx artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: linux-wheels-${{ matrix.python_version }}
           path: wheelhouse/mlx-*.whl
           retention-days: 7
       - name: Upload mlx-cpu artifacts
         if: matrix.python_version == '3.10'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: mlx-cpu
           path: wheelhouse/mlx_cpu-*.whl
           retention-days: 7
+      - run: df -h
 
   build_linux_with_tests:
     strategy:
@@ -46,14 +47,13 @@ jobs:
           - ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-linux
         with:
           python-version: ${{ matrix.python_version }}
       - uses: ./.github/actions/build-linux
       - uses: ./.github/actions/test-linux
-        with:
-          cpu-only: true
+      - run: df -h
 
   build_mac_release:
     if: github.repository == 'ml-explore/mlx'
@@ -62,11 +62,16 @@ jobs:
         python-version: ["3.10", "3.13"]
     runs-on: [self-hosted, macos]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-macos
         with:
           python-version: ${{ matrix.python-version }}
       - uses: ./.github/actions/build-macos
+      - name: Build macOS 26 package
+        uses: ./.github/actions/build-macos-release
+        with:
+          macos-target: 26.0
+          build-backend: ${{ matrix.python-version == '3.10' }}
       - name: Build macOS 15 package
         uses: ./.github/actions/build-macos-release
         with:
@@ -82,7 +87,7 @@ jobs:
     if: github.repository == 'ml-explore/mlx'
     runs-on: ubuntu-22-large
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-linux
         with:
           toolkit: 'cuda-12.9'
@@ -90,9 +95,10 @@ jobs:
         uses: ./.github/actions/build-cuda-release
         with:
           toolkit: 'cuda-12.9'
+          arch: 'x86_64'
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: mlx-cuda
-          path: wheelhouse/mlx_cuda-*.whl
+          path: wheelhouse/mlx_cuda_*.whl
           retention-days: 7

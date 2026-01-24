@@ -36,6 +36,10 @@ bool fast::ScaledDotProductAttention::use_fallback(
   return true;
 }
 
+bool fast::ScaledDotProductAttention::supports_bool_mask() {
+  return false;
+}
+
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
     Stream s) {
@@ -120,6 +124,7 @@ NO_GPU(Partition)
 NO_GPU(Power)
 NO_GPU_MULTI(QRF)
 NO_GPU(QuantizedMatmul)
+NO_GPU(QQMatmul)
 NO_GPU(RandomBits)
 NO_GPU(Real)
 NO_GPU(Reduce)

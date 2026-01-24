@@ -3397,9 +3397,11 @@ std::vector<array> QuantizedMatmul::vjp(
       throw std::runtime_error(
           "[QuantizedMatmul::vjp] no gradient wrt the quantized weights.");
     } else {
-      if (mode_ == QuantizationMode::Mxfp4) {
-        throw std::invalid_argument(
-            "[QuantizedMatmul::vjp] no gradient wrt scales with mxfp4 quantization.");
+      if (mode_ != QuantizationMode::Affine) {
+        std::ostringstream msg;
+        msg << "[QuantizedMatmul::vjp] no gradient wrt scales in "
+            << quantization_mode_to_string(mode_) << " quantization.";
+        throw std::invalid_argument(msg.str());
       }
       if (!dsb) {
         int ndim = primals[1].ndim();
@@ -3466,6 +3468,67 @@ std::vector<Shape> QuantizedMatmul::output_shapes(
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
   return {std::move(out_shape)};
+}
+
+bool QQMatmul::is_equivalent(const Primitive& other) const {
+  const QQMatmul& qm_other = static_cast<const QQMatmul&>(other);
+  return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+      mode_ == qm_other.mode_;
+}
+
+std::vector<Shape> QQMatmul::output_shapes(const std::vector<array>& inputs) {
+  auto out_shape = inputs[0].shape();
+  int w_outer_dims = inputs[1].shape(-2);
+  out_shape.back() = w_outer_dims;
+  return {std::move(out_shape)};
+}
+
+std::vector<array> QQMatmul::vjp(
+    const std::vector<array>& primals, // non quantized x, non quantized w
+    const std::vector<array>& cotangents, // non quantized upstream grads
+    const std::vector<int>& argnums,
+    const std::vector<array>&) {
+  if (primals.size() != 2) {
+    throw std::runtime_error(
+        "[QQMatmul::vjp] Expected exactly 2 non-quantized primal inputs (x, w).");
+  }
+  std::vector<array> vjps;
+  auto& cotan = cotangents[0];
+  auto& s = stream();
+  // primal[1] -- non quantized w (N, K)
+  // primal[0] -- non quantized activations (M, K)
+  // cotan -- non quantized grads (M, N)
+  auto qmode = quantization_mode_to_string(mode_);
+  for (auto arg : argnums) {
+    if (arg == 0) { // gradient wrt to x
+      // We transpose weights -> quantize along N
+      vjps.push_back(qqmm(
+          cotan, //  M X N
+          swapaxes(primals[1], -1, -2, s), // assuming that w is 2D
+          {},
+          group_size_,
+          bits_,
+          qmode,
+          s));
+    } else if (arg == 1) { // gradient wrt to weights
+      vjps.push_back(qqmm(
+          swapaxes(cotan, -1, -2, s), // (N, M)
+          swapaxes(primals[0], -1, -2, s), // (K, M)
+          {},
+          group_size_,
+          bits_,
+          qmode,
+          s));
+    }
+  }
+  return vjps;
+}
+
+std::vector<array> QQMatmul::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  throw std::runtime_error("QQMM::jvp NYI");
 }
 
 std::pair<std::vector<array>, std::vector<int>> GatherQMM::vmap(
@@ -3541,9 +3604,11 @@ std::vector<array> GatherQMM::vjp(
       throw std::runtime_error(
           "[GatherQMM::vjp] no gradient wrt the quantized weights.");
     } else {
-      if (mode_ == QuantizationMode::Mxfp4) {
-        throw std::invalid_argument(
-            "[GatherQMM::vjp] no gradient wrt scales with mxfp4 quantization.");
+      if (mode_ != QuantizationMode::Affine) {
+        std::ostringstream msg;
+        msg << "[GatherQMM::vjp] no gradient wrt scales in "
+            << quantization_mode_to_string(mode_) << " quantization.";
+        throw std::invalid_argument(msg.str());
       }
 
       if (!dsb) {
@@ -3648,7 +3713,7 @@ std::pair<std::vector<array>, std::vector<int>> RandomBits::vmap(
 
 bool RandomBits::is_equivalent(const Primitive& other) const {
   const RandomBits& r_other = static_cast<const RandomBits&>(other);
-  return shape_ == r_other.shape_;
+  return shape_ == r_other.shape_ && width_ == r_other.width_;
 }
 
 std::vector<array> Real::vjp(
@@ -3843,6 +3908,62 @@ std::vector<array> Reduce::vjp(
 
   else {
     return {zeros_like(in, stream())};
+  }
+}
+
+std::vector<array> Reduce::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  auto in = primals[0];
+  auto s = stream();
+
+  auto grad_op = [&s, reduce_type = reduce_type_](
+                     const array& x, const array& tan, int axis) {
+    if (reduce_type == Reduce::Min) {
+      auto idx = argmin(x, axis, true, s);
+      return take_along_axis(tan, idx, axis, s);
+    } else if (reduce_type == Reduce::Max) {
+      auto idx = argmax(x, axis, true, s);
+      return take_along_axis(tan, idx, axis, s);
+    } else {
+      auto p1 = cumprod(x, axis, /*reverse=*/false, /*inclusive=*/false, s);
+      auto p2 = cumprod(x, axis, /*reverse=*/true, /*inclusive=*/false, s);
+      auto out = multiply(multiply(p1, p2, s), tan, s);
+      return sum(out, axis, true, s);
+    }
+  };
+
+  auto tan = tangents[0];
+  if (reduce_type_ == Reduce::Sum) {
+    return {sum(tan, axes_, true, s)};
+  } else {
+    if (axes_.size() > 1) {
+      std::vector<int> transpose_to;
+      {
+        // Find the transpose needed to move axes_ to the back.
+        int j = 0;
+        for (int i = 0; i < in.ndim(); i++) {
+          if (j < axes_.size() && axes_[j] == i) {
+            j++;
+          } else {
+            transpose_to.push_back(i);
+          }
+        }
+        for (auto ax : axes_) {
+          transpose_to.push_back(ax);
+        }
+      }
+
+      int start_ax = in.ndim() - axes_.size();
+      in = flatten(transpose(in, transpose_to, s), start_ax, -1, s);
+      tan = flatten(transpose(tan, transpose_to, s), start_ax, -1, s);
+
+      auto grad = squeeze(grad_op(in, tan, -1), -1, s);
+      return {expand_dims(grad, axes_, s)};
+    } else {
+      return {grad_op(in, tan, axes_[0])};
+    }
   }
 }
 

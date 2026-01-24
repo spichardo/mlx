@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -70,15 +71,13 @@ array indices_or_default(
   return reshape(arange(total, uint32, s), std::move(shape), s);
 }
 
-std::pair<int, int> extract_quantized_matmul_dims(
+void validate_quantized_input(
     std::string_view tag,
-    const array& x,
     const array& w,
     const array& scales,
-    const std::optional<array>& biases,
-    bool transpose,
     int group_size,
-    int bits) {
+    int bits,
+    const std::optional<array>& biases = std::nullopt) {
   if (w.dtype() != uint32) {
     std::ostringstream msg;
     msg << "[" << tag << "] The weight matrix should be uint32 "
@@ -112,6 +111,18 @@ std::pair<int, int> extract_quantized_matmul_dims(
         << " with group_size=" << group_size << " and bits=" << bits;
     throw std::invalid_argument(msg.str());
   }
+}
+
+std::pair<int, int> extract_quantized_matmul_dims(
+    std::string_view tag,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    bool transpose,
+    int group_size,
+    int bits) {
+  validate_quantized_input(tag, w, scales, group_size, bits, biases);
 
   int x_inner_dims = x.shape(-1);
 
@@ -231,11 +242,13 @@ array linspace(
   if (num == 1) {
     return astype(array({start}), dtype, s);
   }
-  array t = divide(arange(0, num, float32, s), array(num - 1, float32), s);
-  array t_bar = subtract(array(1, float32), t, s);
+  auto inner_type = dtype == float64 ? float64 : float32;
+  array t =
+      divide(arange(0, num, inner_type, s), array(num - 1, inner_type), s);
+  array t_bar = subtract(array(1, inner_type), t, s);
   return astype(
-      add(multiply(t_bar, array(start, float32), s),
-          multiply(t, array(stop, float32), s),
+      add(multiply(t_bar, array(start, inner_type), s),
+          multiply(t, array(stop, inner_type), s),
           s),
       dtype,
       s);
@@ -3149,9 +3162,9 @@ array take(
   }
 
   // Check for valid take
-  if (a.size() == 0 && indices.size() != 0) {
+  if (a.shape(axis) == 0 && indices.size() != 0) {
     throw std::invalid_argument(
-        "[take] Cannot do a non-empty take from an array with zero elements.");
+        "[take] Cannot do a non-empty take from an empty axis.");
   }
 
   // Handle negative axis
@@ -3466,10 +3479,8 @@ array masked_scatter(
   if (mask.dtype() != bool_) {
     throw std::invalid_argument("[masked_scatter] The mask has to be boolean.");
   }
-  if (mask.ndim() == 0) {
-    throw std::invalid_argument(
-        "[masked_scatter] Scalar masks are not supported.");
-  } else if (mask.ndim() > a.ndim()) {
+
+  if (mask.ndim() > a.ndim()) {
     throw std::invalid_argument(
         "[masked_scatter] The mask cannot have more dimensions than the target.");
   }
@@ -4179,6 +4190,11 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
     } else {
       return {dtype, qmode};
     }
+  } else if (scales.dtype() != uint8) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Scale type must be uint8 but received type "
+        << scales.dtype() << ".";
+    throw std::invalid_argument(msg.str());
   }
   if (biases) {
     std::ostringstream msg;
@@ -4246,6 +4262,145 @@ array quantized_matmul(
       std::move(inputs));
 }
 
+void validate_qqmm_inputs(
+    array x,
+    array w,
+    std::optional<array> scales_w,
+    int group_size,
+    int bits) {
+  // check 2D (for now)
+  if (x.ndim() > 2 || w.ndim() > 2) {
+    std::ostringstream msg;
+    msg << "[qqmm] Only 2D inputs are supported but "
+        << "x.ndim() == " << x.ndim() << " and "
+        << "w.ndim() == " << w.ndim() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.dtype() == uint32) {
+    // if w is quantized, scales are provided
+    if (!scales_w.has_value()) {
+      std::ostringstream msg;
+      throw std::invalid_argument(
+          "[qqmm] Scales must be provided if second argument is quantized.");
+    }
+    // if scales are provided, check compatibility with quantized w
+    else {
+      validate_quantized_input("qqmm", w, *scales_w, group_size, bits);
+    }
+  }
+  // if w is not quantized, dtype must be in {f16, bf16, fp32}
+  else {
+    if (!issubdtype(w.dtype(), floating) || w.dtype() == float64) {
+      std::ostringstream msg;
+      msg << "[qqmm] Only real floating types except float64 are supported but "
+          << "second argument dtype == " << w.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  // x dtype must be in {f16, bf16, fp32}
+  if (!issubdtype(x.dtype(), floating) || x.dtype() == float64) {
+    std::ostringstream msg;
+    msg << "[qqmm] Only real floating types except float64 are supported but "
+        << "first argument dtype == " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+std::pair<int, int> extract_qqmm_dims(
+    array x,
+    array w,
+    std::optional<array> scales_w,
+    int group_size,
+    int bits) {
+  if (w.dtype() != uint32) {
+    // if w is not quantized, check that last dims match
+    if (x.shape(-1) != w.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[qqmm] Last dimension of first input with shape " << x.shape()
+          << " must match last dimension of"
+          << " second input with shape " << w.shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    return std::make_pair(w.shape(-1), w.shape(-2));
+  } else {
+    // if w is quantized, extract dims from quantized w
+    return extract_quantized_matmul_dims(
+        "qqmm",
+        x,
+        w,
+        *scales_w,
+        std::nullopt,
+        /* transpose = */ true,
+        group_size,
+        bits);
+  }
+}
+
+array qqmm(
+    array in_x,
+    array w,
+    std::optional<array> scales_w,
+    std::optional<int> group_size_ /* = std::nullopt */,
+    std::optional<int> bits_ /* = std::nullopt */,
+    const std::string& mode /* = "nvfp4" */,
+    StreamOrDevice s /* = {} */) {
+  auto stream = to_stream(s);
+  if (stream.device != Device::gpu || !cu::is_available()) {
+    throw std::invalid_argument(
+        "[qqmm] Only supported on GPU with the CUDA backend.");
+  }
+  auto qmode = string_to_quantization_mode(mode, "qqmm");
+  // cuBLAS block scaled matmul only supports nvfp4 and mxfp8
+  if (qmode != QuantizationMode::Nvfp4 && qmode != QuantizationMode::Mxfp8) {
+    std::ostringstream msg;
+    msg << "[qqmm] Only 'nvfp4' and 'mxfp8' quantization modes are supported but '"
+        << mode << "' was provided.";
+    throw std::invalid_argument(msg.str());
+  }
+  // we need to check 2 cases:
+  // 1. w is quantized, scales is provided
+  // 2. w is not quantized, scales is not provided
+  auto [group_size, bits] =
+      quantization_params_from_mode(qmode, group_size_, bits_);
+
+  // Allow gemv
+  auto x = in_x;
+  if (x.ndim() == 1) {
+    // Insert a singleton dim in the beginning
+    x = expand_dims(x, 0, s);
+  } else if (w.ndim() == 2 && x.ndim() > 2) {
+    x = flatten(x, 0, -2, s);
+  }
+
+  // validate inputs
+  validate_qqmm_inputs(x, w, scales_w, group_size, bits);
+  // validate and extract shapes
+  auto [w_inner_dims, w_outer_dims] =
+      extract_qqmm_dims(x, w, scales_w, group_size, bits);
+  std::vector<array> inputs = {
+      x,
+      w,
+  };
+  if (scales_w.has_value()) {
+    inputs.push_back(*scales_w);
+  }
+  auto out_shape = inputs[0].shape();
+  out_shape.back() = w_outer_dims;
+  auto out = array(
+      std::move(out_shape),
+      x.dtype(), // output dtype is the same as x dtype
+      std::make_shared<QQMatmul>(stream, group_size, bits, qmode),
+      std::move(inputs));
+  if (in_x.ndim() > 2) {
+    auto orig_shape = in_x.shape();
+    orig_shape.pop_back();
+    out = unflatten(out, 0, std::move(orig_shape), s);
+  } else if (in_x.ndim() == 1) {
+    out = squeeze(out, 0, s);
+  }
+  return out;
+}
+
 array pack_and_quantize(
     array& packed_w,
     const array& scales,
@@ -4266,8 +4421,11 @@ array pack_and_quantize(
   if (is_power_of_2(bits)) {
     array shifts = power(array(2, uint32), arange(0, 32, bits, uint32, s), s);
     packed_w = reshape(packed_w, {packed_w.shape(0), -1, el_per_int}, s);
-    packed_w = sum(
-        multiply(packed_w, shifts, s), /* axis= */ 2, /* keepdims= */ false, s);
+    packed_w =
+        sum(multiply(packed_w, shifts, s),
+            /* axis= */ 2,
+            /* keepdims= */ false,
+            s);
   } else {
     // This is slow but we have fast GPU/CPU versions of this function so we
     // shouldn't be here often.
