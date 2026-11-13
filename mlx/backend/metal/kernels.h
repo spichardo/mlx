@@ -64,6 +64,11 @@ MTL::ComputePipelineState* get_logsumexp_kernel(
     const std::string& kernel_name,
     const array& out);
 
+MTL::ComputePipelineState* get_cross_entropy_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in);
+
 MTL::ComputePipelineState* get_scan_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -80,6 +85,12 @@ MTL::ComputePipelineState* get_sort_kernel(
     const array& out,
     int bn,
     int tn);
+
+MTL::ComputePipelineState* get_searchsorted_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in,
+    bool right);
 
 MTL::ComputePipelineState* get_mb_sort_kernel(
     metal::Device& d,
@@ -201,6 +212,43 @@ MTL::ComputePipelineState* get_steel_conv_kernel(
     int n_channel_specialization,
     bool small_filter);
 
+MTL::ComputePipelineState* get_steel_conv_3d_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    bool small_filter);
+
+MTL::ComputePipelineState* get_gemv_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    bool transpose_mat,
+    int bm,
+    int bn,
+    int sm,
+    int sn,
+    int tm,
+    int tn,
+    bool nc,
+    bool axpby);
+
+MTL::ComputePipelineState* get_gemv_gather_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    bool transpose_mat,
+    int bm,
+    int bn,
+    int sm,
+    int sn,
+    int tm,
+    int tn);
+
 MTL::ComputePipelineState* get_gemv_masked_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -215,6 +263,24 @@ MTL::ComputePipelineState* get_gemv_masked_kernel(
     int tm,
     int tn,
     bool contiguous);
+
+MTL::ComputePipelineState* get_gemv_wide_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    int vecs_per_tg,
+    int k_lanes);
+
+MTL::ComputePipelineState* get_gemv_wide_gather_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    int vecs_per_tg,
+    int k_lanes);
 
 MTL::ComputePipelineState* get_steel_conv_general_kernel(
     metal::Device& d,
@@ -235,6 +301,11 @@ MTL::ComputePipelineState* get_fft_kernel(
     const metal::MTLFCList& func_consts,
     const std::string& template_def);
 
+MTL::ComputePipelineState* get_fft_twiddle_kernel(
+    metal::Device& d,
+    const std::string& library_name,
+    const std::string& template_def);
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -247,15 +318,16 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     const std::string& hash_name,
     const metal::MTLFCList& func_consts,
     const array& x,
+    const std::string& mode,
     int group_size,
     int bits,
-    const std::string& mode,
+    bool has_global_scale,
+    bool transpose,
     int bm,
     int bn,
     int bk,
     int wm,
-    int wn,
-    bool transpose);
+    int wn);
 
 MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     metal::Device& d,
@@ -286,6 +358,41 @@ MTL::ComputePipelineState* get_steel_gemm_gather_nax_kernel(
     int wn,
     bool rhs);
 
+MTL::ComputePipelineState* get_steel_gemm_splitk_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& in,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn);
+
+MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn);
+
+MTL::ComputePipelineState* get_steel_gemm_thin_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const std::string& template_def);
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -298,15 +405,16 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     const std::string& hash_name,
     const metal::MTLFCList& func_consts,
     const array& x,
+    const std::string& mode,
     int group_size,
     int bits,
-    const std::string& mode,
+    bool has_global_scale,
+    bool transpose,
     int bm,
     int bn,
     int bk,
     int wm,
-    int wn,
-    bool transpose);
+    int wn);
 
 MTL::ComputePipelineState* get_steel_attention_kernel(
     metal::Device& d,
@@ -317,6 +425,7 @@ MTL::ComputePipelineState* get_steel_attention_kernel(
     int bq,
     int bk,
     int bd,
+    int bv,
     int wm,
     int wn,
     const array& m);
@@ -330,9 +439,72 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int bq,
     int bk,
     int bd,
+    int bv,
     int wm,
     int wn,
-    const array& m);
+    const array& m,
+    bool split_d);
+
+MTL::ComputePipelineState* get_steel_attention_split_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int bq,
+    int bk,
+    int bd,
+    int wm,
+    int wn);
+
+MTL::ComputePipelineState* get_steel_attention_split_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int bk,
+    int bd,
+    int wn);
+
+MTL::ComputePipelineState* get_gated_delta_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts);
+
+MTL::ComputePipelineState* get_gated_delta_vjp_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts);
+
+MTL::ComputePipelineState* get_gated_delta_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int dk,
+    int dv,
+    int hk,
+    int hv,
+    int c,
+    int ckpt);
+
+MTL::ComputePipelineState* get_gated_delta_vjp_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int dk,
+    int dv,
+    int hk,
+    int hv,
+    int c,
+    int ckpt,
+    bool dgamma);
 
 // Create a GPU kernel template definition for JIT compilation
 template <typename... Args>

@@ -16,7 +16,7 @@ template <
     bool transpose_a,
     bool transpose_b,
     typename AccumType = float>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void segmented_mm(
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void segmented_mm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
     const device uint32_t* segments [[buffer(2)]],
@@ -79,8 +79,8 @@ template <
     k_start = segments[tid.z];
     k_end = segments[tid.z + 1];
   }
-  A += transpose_a ? k_start * params->lda : k_start;
-  B += transpose_b ? k_start : k_start * params->ldb;
+  A += transpose_a ? int64_t(k_start) * params->lda : k_start;
+  B += transpose_b ? k_start : int64_t(k_start) * params->ldb;
   C += tid.z * params->batch_stride_d;
 
   // Prepare threadgroup mma operation

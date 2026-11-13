@@ -10,7 +10,7 @@ using namespace metal;
 struct _NoMask {
   char x;
 
-  constexpr METAL_FUNC operator bool() {
+  constexpr METAL_FUNC operator bool() thread {
     return true;
   }
   constexpr METAL_FUNC operator bool() const threadgroup {
@@ -30,7 +30,7 @@ template <typename OutT, typename InT = OutT>
 struct ScaleOp {
   OutT scale;
 
-  METAL_FUNC OutT apply(InT x) const {
+  METAL_FUNC OutT apply(InT x) const thread {
     return static_cast<OutT>(x) * scale;
   }
 };
@@ -452,7 +452,7 @@ struct GEMVTKernel {
     const int n_block_idx = blockM > blockN ? out_col / blockM : int(tid.x);
 
     const int out_mask_offset =
-        !has_output_mask ? 0 : n_block_idx; // * out_mask_strides[0];
+        !has_output_mask ? 0 : n_block_idx * out_mask_strides[0];
 
     int mat_mask_offset =
         !has_operand_mask ? 0 : n_block_idx * mat_mask_strides[0];
@@ -641,7 +641,7 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoNCBatch> /* Batch ndim > 1 */
-[[kernel, max_total_threads_per_threadgroup(BM* BN * 32)]] void gemv_masked(
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_masked(
     const device T* mat [[buffer(0)]],
     const device T* in_vec [[buffer(1)]],
     device T* out_vec [[buffer(3)]],
@@ -741,7 +741,7 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoNCBatch> /* Batch ndim > 1 */
-[[kernel, max_total_threads_per_threadgroup(BM* BN * 32)]] void gemv_t_masked(
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_t_masked(
     const device T* mat [[buffer(0)]],
     const device T* in_vec [[buffer(1)]],
     device T* out_vec [[buffer(3)]],

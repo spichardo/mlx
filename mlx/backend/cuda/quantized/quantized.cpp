@@ -1,69 +1,331 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
-#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/cuda/quantized/qmm/qmm.h"
+#include "mlx/backend/cuda/quantized/quantized_utils.h"
+#include "mlx/dtype_utils.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/primitives.h"
 
 #include <nvtx3/nvtx3.hpp>
 
 namespace mlx::core {
 
-namespace {
+void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+  auto& s = stream();
+  auto& encoder = cu::get_command_encoder(s);
 
-inline array ensure_row_contiguous(
-    const array& x,
-    cu::CommandEncoder& enc,
-    const Stream& s) {
-  if (!x.flags().row_contiguous) {
-    array x_copy = contiguous_copy_gpu(x, s);
-    enc.add_temporary(x_copy);
-    return x_copy;
-  } else {
-    return x;
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
+  const array& w = inputs[1];
+  const array& scales = inputs[2];
+  std::optional<array> biases;
+  if (inputs.size() > 3) {
+    biases = inputs[3];
   }
-}
 
-inline array
-ensure_contiguous(const array& x, cu::CommandEncoder& enc, const Stream& s) {
-  if (x.flags().row_contiguous || x.flags().col_contiguous) {
-    return x;
-  }
-  array x_copy = contiguous_copy_gpu(x, s);
-  enc.add_temporary(x_copy);
-  return x_copy;
-}
+  auto supports = [&](auto&& f) {
+    return f(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder.device());
+  };
+  bool can_use_qmm_sm90 = supports(supports_qmm_sm90);
+  bool can_use_qmm_sm80 = supports(supports_qmm_sm80);
+  bool can_use_qmm_naive = supports(supports_qmm_naive);
+  bool can_use_fp_qmv = supports(supports_fp_qmv);
+  bool can_use_qmv = supports(supports_qmv) || can_use_fp_qmv;
 
-inline array ensure_row_contiguous_matrix(
-    const array& x,
-    cu::CommandEncoder& enc,
-    const Stream& s) {
-  if (x.ndim() < 2) {
-    if (x.strides()[0] == 1) {
-      return x;
+  auto call_qmm_sm90 = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_sm90(x, w, scales, *biases, out, bits_, group_size_, encoder, s);
+  };
+  auto call_qmm_sm80 = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_sm80(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        std::nullopt,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+  auto call_qmm_naive = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_naive(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+  auto call_qmv = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    if (can_use_fp_qmv) {
+      fp_qmv(x, w, scales, out, bits_, group_size_, encoder, s);
+    } else {
+      qmv(x,
+          w,
+          scales,
+          biases,
+          std::nullopt,
+          out,
+          bits_,
+          group_size_,
+          mode_,
+          encoder);
     }
-  } else {
-    auto stride_0 = x.strides()[x.ndim() - 2];
-    auto stride_1 = x.strides()[x.ndim() - 1];
-    if (stride_0 == x.shape(-1) && stride_1 == 1) {
-      return x;
+  };
+
+  int M = out.ndim() > 1 ? out.shape(-2) : 1;
+  int N = out.shape(-1);
+  int K = x.shape(-1);
+  int B = out.size() / (M * N);
+
+  if (can_use_qmm_sm90) {
+    if (can_use_qmv && (M == 1 && B == 1 && N <= 16384 && K <= 16384)) {
+      call_qmv();
+    } else {
+      call_qmm_sm90();
     }
+    return;
   }
-  array x_copy = contiguous_copy_gpu(x, s);
-  enc.add_temporary(x_copy);
-  return x_copy;
+
+  if (can_use_qmm_sm80) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      call_qmm_sm80();
+    }
+    return;
+  }
+
+  if (can_use_qmm_naive) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      call_qmm_naive();
+    }
+    return;
+  }
+
+  if (can_use_qmv) {
+    call_qmv();
+    return;
+  }
+
+  throw std::runtime_error(
+      fmt::format(
+          "[quantized_matmul] No implementation for "
+          "problem shape: {}x{}x{}x{}, transpose: {}, "
+          "activation: {}, bits: {}, group size: {}, mode: \"{}\".",
+          M,
+          N,
+          K,
+          B,
+          transpose_,
+          dtype_to_string(x.dtype()),
+          bits_,
+          group_size_,
+          quantization_mode_to_string(mode_)));
 }
 
-} // namespace
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("GatherQMM::eval_gpu");
+  auto& s = stream();
+  auto& encoder = cu::get_command_encoder(s);
+
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
+  const array& w = inputs[1];
+  const array& scales = inputs[2];
+  // Affine gets biases at index 3, nvfp4 an optional global scale.
+  std::optional<array> biases;
+  std::optional<array> global_scale;
+  if (mode_ == QuantizationMode::Affine) {
+    biases = inputs[3];
+  } else if (inputs.size() == 6) {
+    global_scale = ensure_row_contiguous(inputs[3], encoder, s);
+  }
+  array lhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 2], encoder, s);
+  array rhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 1], encoder, s);
+
+  int M = out.ndim() > 1 ? out.shape(-2) : 1;
+  int N = out.shape(-1);
+  int K = x.shape(-1);
+  int B = out.size() / (M * N);
+
+  auto supports = [&](auto&& f) {
+    return f(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder.device());
+  };
+  // qmm_sm80 does not apply global scales yet; route such calls to the
+  // naive kernel until it does.
+  bool can_use_qmm_sm80 =
+      !global_scale.has_value() && supports(supports_qmm_sm80);
+  bool can_use_gather_qmm_rhs_sm80 = mode_ != QuantizationMode::Affine &&
+      right_sorted_ && !global_scale.has_value() &&
+      supports(supports_gather_qmm_rhs_sm80);
+  bool can_use_qmm_naive = supports(supports_qmm_naive);
+  bool can_use_fp_gather_qmv = supports(supports_fp_gather_qmv);
+  bool can_use_qmv = supports(supports_qmv) || can_use_fp_gather_qmv;
+  bool prefer_qmv = can_use_fp_gather_qmv || (can_use_qmv && M * B < 8);
+
+  auto call_qmm_sm80 = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_sm80(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+  auto call_qmm_naive = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_naive(
+        x,
+        w,
+        scales,
+        biases,
+        global_scale,
+        lhs_indices,
+        rhs_indices,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+  auto call_qmv = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    if (can_use_fp_gather_qmv) {
+      fp_gather_qmv(
+          x,
+          w,
+          scales,
+          global_scale,
+          lhs_indices,
+          rhs_indices,
+          out,
+          bits_,
+          group_size_,
+          encoder);
+      return;
+    }
+    gather_qmv(
+        x,
+        w,
+        scales,
+        biases,
+        global_scale,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+
+  if (can_use_gather_qmm_rhs_sm80) {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    gather_qmm_rhs_sm80(
+        x,
+        w,
+        scales,
+        biases,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+    return;
+  }
+
+  if (can_use_qmm_sm80) {
+    if (prefer_qmv) {
+      call_qmv();
+    } else {
+      call_qmm_sm80();
+    }
+    return;
+  }
+
+  if (can_use_qmm_naive) {
+    if (prefer_qmv) {
+      call_qmv();
+    } else {
+      call_qmm_naive();
+    }
+    return;
+  }
+
+  if (can_use_qmv) {
+    call_qmv();
+    return;
+  }
+
+  throw std::runtime_error(
+      fmt::format(
+          "[gather_qmm] No implementation for "
+          "problem shape: {}x{}x{}x{}, transpose: {}, "
+          "activation: {}, bits: {}, group size: {}, mode: \"{}\".",
+          M,
+          N,
+          K,
+          B,
+          transpose_,
+          dtype_to_string(x.dtype()),
+          bits_,
+          group_size_,
+          quantization_mode_to_string(mode_)));
+}
 
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   nvtx3::scoped_range r("Quantize::eval_gpu");
   auto& s = stream();
-  auto& d = cu::device(s.device);
-  auto& enc = d.get_command_encoder(s);
-
+  auto& enc = cu::get_command_encoder(s);
   if (dequantize_) {
     auto wq = ensure_row_contiguous(inputs[0], enc, s);
     auto scales = ensure_row_contiguous(inputs[1], enc, s);
@@ -75,7 +337,12 @@ void fast::Quantize::eval_gpu(
       auto biases = ensure_row_contiguous(inputs[2], enc, s);
       affine_dequantize(wq, scales, biases, w, group_size_, bits_, enc, s);
     } else {
-      fp_dequantize(wq, scales, w, group_size_, bits_, enc, s);
+      // 0 -- xq, 1 -- scales, 2 -- could be global scale for nvfp4
+      bool use_global_scale =
+          mode_ == QuantizationMode::Nvfp4 && inputs.size() > 2;
+      std::optional<array> global_scale =
+          use_global_scale ? std::make_optional(inputs[2]) : std::nullopt;
+      fp_dequantize(wq, scales, w, group_size_, bits_, global_scale, enc, s);
     }
   } else {
     auto w = ensure_contiguous(inputs[0], enc, s);
@@ -84,12 +351,17 @@ void fast::Quantize::eval_gpu(
 
     wq.set_data(cu::malloc_async(wq.nbytes(), enc));
     scales.set_data(cu::malloc_async(scales.nbytes(), enc));
+
     if (mode_ == QuantizationMode::Affine) {
       auto& biases = outputs[2];
       biases.set_data(cu::malloc_async(biases.nbytes(), enc));
       affine_quantize(w, wq, scales, biases, group_size_, bits_, enc, s);
     } else {
-      fp_quantize(w, wq, scales, group_size_, bits_, enc, s);
+      bool use_global_scale =
+          mode_ == QuantizationMode::Nvfp4 && inputs.size() > 1;
+      std::optional<array> global_scale =
+          use_global_scale ? std::make_optional(inputs[1]) : std::nullopt;
+      fp_quantize(w, wq, scales, group_size_, bits_, global_scale, enc, s);
     }
   }
 }

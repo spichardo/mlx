@@ -2,30 +2,50 @@
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/cuda/allocator.h"
-#include "mlx/backend/cuda/device.h"
-#include "mlx/backend/gpu/available.h"
+#include "mlx/backend/cuda/cublas_utils.h"
+#include "mlx/backend/cuda/cudnn_utils.h"
+#include "mlx/backend/cuda/cusolver_utils.h"
+#include "mlx/backend/cuda/event.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
+#include "mlx/utils.h"
 
 #include <nvtx3/nvtx3.hpp>
 
 namespace mlx::core::gpu {
 
-bool is_available() {
-  return true;
+void init() {
+  // Force initialization of CUDA, so CUDA runtime get destroyed last.
+  cudaFree(nullptr);
+  // Make sure native resources get destroyed after CommandEncoder.
+  mlx::core::cu::CudaEvent::init_pool();
+  init_cublas_handles_cache();
+  init_cudnn_handles_cache();
+  init_cusolver_handles_cache();
+  init_cudnn_conv_cache();
+  init_cudnn_sdpa_cache();
 }
 
 void new_stream(Stream s) {
-  // Force initalization of CUDA, so CUDA runtime get destroyed at last.
-  cudaFree(nullptr);
-  // Make sure CUDA event pool get destroyed after device and stream.
-  cu::CudaEvent::init_pool();
-  // Ensure the static stream objects get created.
-  cu::get_command_encoder(s);
+  assert(s.device == Device::gpu);
+  auto& encoders = cu::get_command_encoders();
+  auto& d = cu::device(s.device);
+  encoders.try_emplace(s.index, d);
+}
+
+void new_thread_unsafe_stream(Stream s) {
+  assert(s.device == Device::gpu);
+  auto& encoders = cu::get_global_command_encoders();
+  auto& d = cu::device(s.device);
+  encoders.try_emplace(s.index, d);
 }
 
 void eval(array& arr) {
   nvtx3::scoped_range r("gpu::eval");
+  // Ensure CUDA context is active on this thread. Required when MLX is called
+  // from threads that have not yet established a CUDA context (e.g. thread
+  // pools, language runtimes that migrate work across OS threads).
+  cu::device(arr.primitive().stream().device).make_current();
   auto outputs = arr.outputs();
   {
     // If the array is a tracer hold a reference
@@ -50,6 +70,10 @@ void eval(array& arr) {
     encoder.add_temporary(s);
   }
 
+#ifndef NDEBUG
+  encoder.verify_graph(arr.primitive().name());
+#endif
+
   if (encoder.needs_commit()) {
     scheduler::notify_new_task(stream);
     encoder.add_completed_handler(
@@ -66,6 +90,13 @@ void finalize(Stream s) {
 void synchronize(Stream s) {
   nvtx3::scoped_range r("gpu::synchronize");
   cu::get_command_encoder(s).synchronize();
+}
+
+void clear_streams() {
+  cu::get_command_encoders().clear();
+  if (is_main_thread()) {
+    cu::get_global_command_encoders().clear();
+  }
 }
 
 } // namespace mlx::core::gpu

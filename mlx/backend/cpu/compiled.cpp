@@ -1,16 +1,17 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <dlfcn.h>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <list>
 #include <mutex>
+#include <random>
 #include <shared_mutex>
 
 #include <fmt/format.h>
 
 #include "mlx/backend/common/compiled.h"
-#include "mlx/backend/cpu/compiled_preamble.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/jit_compiler.h"
 #include "mlx/device.h"
@@ -42,15 +43,18 @@ struct CompilerCache {
 };
 
 static CompilerCache& cache() {
-  static CompilerCache cache_;
-  return cache_;
+  // Leak - see Scheduler singleton comment in scheduler.cpp.
+  // DLib destructors call dlclose() which unmaps JIT .so files;
+  // StreamThreads may still be executing that code at exit.
+  static CompilerCache* cache_ = new CompilerCache;
+  return *cache_;
 };
 
-// GPU compile is always available if the GPU is available and since we are in
-// this file CPU compile is also available.
+// GPU compile is available through the GPU backend. CPU compile requires a
+// usable C++ compiler (MSVC or clang-cl on Windows).
 namespace detail {
 bool compile_available_for_device(const Device& device) {
-  return true;
+  return device == Device::gpu || JitCompiler::available();
 }
 
 } // namespace detail
@@ -95,13 +99,19 @@ void* compile(
     kernel_file_name = kernel_name;
   }
 
-  auto output_dir =
-      std::filesystem::temp_directory_path() / "mlx" / version() / "cpu";
-  if (!std::filesystem::exists(output_dir)) {
-    std::filesystem::create_directories(output_dir);
-  }
+  static const std::filesystem::path output_dir = [] {
+    if (auto dir = std::getenv("MLX_CPU_CACHE_DIR"); dir && *dir) {
+      return std::filesystem::absolute(dir);
+    }
+    return std::filesystem::temp_directory_path() / "mlx" / version() / "cpu";
+  }();
+  std::filesystem::create_directories(output_dir);
 
+#ifdef _WIN32
+  std::string shared_lib_name = kernel_file_name + ".dll";
+#else
   std::string shared_lib_name = "lib" + kernel_file_name + ".so";
+#endif
   auto shared_lib_path = (output_dir / shared_lib_name).string();
   bool lib_exists = false;
   {
@@ -110,22 +120,42 @@ void* compile(
   }
 
   if (!lib_exists) {
-    // Open source file and write source code to it
-    std::string source_file_name = kernel_file_name + ".cpp";
-    auto source_file_path = (output_dir / source_file_name).string();
+    // Build under a unique name, then move the files into place. Other
+    // processes then never load a partly written library.
+    auto tmp_name = fmt::format("tmp_{:08x}", std::random_device{}());
+    std::string source_file_name = tmp_name + ".cpp";
+    std::string tmp_lib_name =
+        tmp_name + std::filesystem::path(shared_lib_name).extension().string();
+    auto source_file_path = output_dir / source_file_name;
+    auto tmp_lib_path = output_dir / tmp_lib_name;
 
     std::ofstream source_file(source_file_path);
     source_file << source_code;
     source_file.close();
 
     try {
-      JitCompiler::exec(JitCompiler::build_command(
-          output_dir, source_file_name, shared_lib_name));
+      JitCompiler::exec(
+          JitCompiler::build_command(
+              output_dir, source_file_name, tmp_lib_name));
     } catch (const std::exception& error) {
-      throw std::runtime_error(fmt::format(
-          "[Compile::eval_cpu] Failed to compile function {0}: {1}",
-          kernel_name,
-          error.what()));
+      throw std::runtime_error(
+          fmt::format(
+              "[Compile::eval_cpu] Failed to compile function {0}: {1}",
+              kernel_name,
+              error.what()));
+    }
+
+    std::error_code error;
+    std::filesystem::rename(
+        source_file_path, output_dir / (kernel_file_name + ".cpp"), error);
+    std::filesystem::rename(tmp_lib_path, shared_lib_path, error);
+    if (error) {
+      // On Windows the rename can fail while another process uses the file.
+      if (std::filesystem::exists(shared_lib_path, error)) {
+        std::filesystem::remove(tmp_lib_path, error);
+      } else {
+        shared_lib_path = tmp_lib_path.string();
+      }
     }
   }
 
@@ -290,7 +320,7 @@ void Compiled::eval_cpu(
 
   // Collapse contiguous dims to route to a faster kernel if possible. Also
   // handle all broadcasting.
-  auto [contiguous, shape, strides] =
+  auto [contiguous, negative_strides, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
 
   // Collect function input arguments.
@@ -314,7 +344,21 @@ void Compiled::eval_cpu(
   // Get the function
   auto fn_ptr = compile(kernel_name, [&, contiguous = contiguous]() {
     std::ostringstream kernel;
-    kernel << get_kernel_preamble() << std::endl;
+    kernel << std::get<2>(JitCompiler::get_preamble()) << std::endl;
+    // The prebuilt preamble is produced by running the preprocessor over
+    // compiled_preamble.h, which consumes the NAN / INFINITY macro definitions
+    // (macros vanish during preprocessing). print_float_constant emits those
+    // macros for non-finite constants, so define them here when missing. The
+    // #ifndef guards avoid clashing when <cmath> is already in scope (e.g. the
+    // include-based preamble path).
+    kernel << "#ifndef INFINITY\n"
+              "#define INFINITY (std::numeric_limits<float>::infinity())\n"
+              "#endif\n";
+    kernel << "#ifndef NAN\n"
+              "#define NAN (std::numeric_limits<float>::quiet_NaN())\n"
+              "#endif\n";
+    kernel << "using namespace mlx::core;" << std::endl;
+    kernel << "using namespace mlx::core::detail;" << std::endl;
     kernel << "extern \"C\"  {" << std::endl;
     build_kernel(
         kernel,

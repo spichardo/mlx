@@ -1,16 +1,14 @@
 // Copyright © 2025 Apple Inc.
 #pragma once
 
-#include <cublasLt.h>
 #include "mlx/array.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/dtype_utils.h"
 
+#include <cublasLt.h>
+
 namespace mlx::core {
 namespace cublas_utils {
-
-// Get the shared cublas preference for a device
-cublasLtMatmulPreference_t get_preference(cu::Device& device);
 
 cublasLtMatrixLayout_t create_matrix_layout(
     cudaDataType_t type,
@@ -34,12 +32,19 @@ inline cudaDataType_t dtype_to_cublas_type(Dtype dtype, std::string_view tag) {
     case complex64:
       return CUDA_C_32F;
     default:
-      throw std::runtime_error(fmt::format(
-          "Unsupported dtype in {}: {}.", tag, dtype_to_string(dtype)));
+      throw std::runtime_error(
+          fmt::format(
+              "Unsupported dtype in {}: {}.", tag, dtype_to_string(dtype)));
   }
 }
 
 } // namespace cublas_utils
+
+void check_cublas_error(const char* name, cublasStatus_t err);
+
+#define CHECK_CUBLAS_ERROR(cmd) check_cublas_error(#cmd, (cmd))
+
+void init_cublas_handles_cache();
 
 class CublasMatmulBase {
  public:

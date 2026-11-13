@@ -29,14 +29,26 @@ struct Init<T, metal::enable_if_t<metal::is_floating_point_v<T>>> {
   static constexpr constant T v = metal::numeric_limits<T>::quiet_NaN();
 };
 
+template <>
+struct Init<complex64_t> {
+  static constexpr constant complex64_t v = complex64_t(
+      metal::numeric_limits<float>::quiet_NaN(),
+      metal::numeric_limits<float>::quiet_NaN());
+};
+
 template <typename T>
 struct LessThan {
   static constexpr constant T init = Init<T>::v;
-  METAL_FUNC bool operator()(T a, T b) const {
-    if constexpr (
-        metal::is_floating_point_v<T> || metal::is_same_v<T, complex64_t>) {
-      bool an = isnan(a);
-      bool bn = isnan(b);
+  METAL_FUNC bool operator()(T a, T b) const thread {
+    if constexpr (metal::is_floating_point_v<T>) {
+      bool an = metal::isnan(a);
+      bool bn = metal::isnan(b);
+      if (an | bn) {
+        return (!an) & bn;
+      }
+    } else if constexpr (metal::is_same_v<T, complex64_t>) {
+      bool an = metal::isnan(a.real) || metal::isnan(a.imag);
+      bool bn = metal::isnan(b.real) || metal::isnan(b.imag);
       if (an | bn) {
         return (!an) & bn;
       }
@@ -125,13 +137,17 @@ struct BlockMergeSort {
     short b_idx = 0;
 
     for (int i = 0; i < N_PER_THREAD; ++i) {
-      auto a = As[a_idx];
-      auto b = Bs[b_idx];
+      auto a = (a_idx < A_sz) ? As[a_idx] : ValT(CompareOp::init);
+      auto b = (b_idx < B_sz) ? Bs[b_idx] : ValT(CompareOp::init);
       bool pred = (b_idx < B_sz) && (a_idx >= A_sz || op(b, a));
 
       vals[i] = pred ? b : a;
       if (ARG_SORT) {
-        idxs[i] = pred ? Bs_idx[b_idx] : As_idx[a_idx];
+        if (pred) {
+          idxs[i] = Bs_idx[b_idx];
+        } else {
+          idxs[i] = (a_idx < A_sz) ? As_idx[a_idx] : IdxT(0);
+        }
       }
 
       b_idx += short(pred);
@@ -264,8 +280,8 @@ struct KernelMergeSort {
       uint3 tid [[threadgroup_position_in_grid]],
       uint3 lid [[thread_position_in_threadgroup]]) {
     // tid.y tells us the segment index
-    inp += tid.y * in_stride_segment_axis;
-    out += tid.y * out_stride_segment_axis;
+    inp += int64_t(tid.y) * in_stride_segment_axis;
+    out += int64_t(tid.y) * out_stride_segment_axis;
 
     // Copy into threadgroup memory
     for (short i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
@@ -372,8 +388,11 @@ template <
   using ValT = typename sort_kernel::ValT;
   using IdxT = typename sort_kernel::IdxT;
 
-  auto in_block_idx = elem_to_loc(tid.y, nc_shape, in_nc_strides, nc_dim);
-  auto out_block_idx = elem_to_loc(tid.y, nc_shape, out_nc_strides, nc_dim);
+  // Signed offsets: a non-sorted axis may have a negative stride.
+  auto in_block_idx =
+      elem_to_loc<int64_t>(tid.y, nc_shape, in_nc_strides, nc_dim);
+  auto out_block_idx =
+      elem_to_loc<int64_t>(tid.y, nc_shape, out_nc_strides, nc_dim);
   inp += in_block_idx;
   out += out_block_idx;
 
@@ -516,10 +535,11 @@ template <
       BLOCK_THREADS,
       N_PER_THREAD>;
 
-  auto block_idx = elem_to_loc(tid.y, nc_shape, nc_strides, nc_dim);
+  // Signed offset: a non-sorted axis may have a negative stride.
+  auto block_idx = elem_to_loc<int64_t>(tid.y, nc_shape, nc_strides, nc_dim);
   inp += block_idx;
-  out_vals += tid.y * size_sorted_axis;
-  out_idxs += tid.y * size_sorted_axis;
+  out_vals += int64_t(tid.y) * size_sorted_axis;
+  out_idxs += int64_t(tid.y) * size_sorted_axis;
 
   threadgroup ValT tgp_vals[sort_kernel::N_PER_BLOCK];
   threadgroup IdxT tgp_idxs[sort_kernel::N_PER_BLOCK];
@@ -559,9 +579,9 @@ template <
       BLOCK_THREADS,
       N_PER_THREAD>;
 
-  block_partitions += tid.y * tgp_dims.x;
-  dev_vals += tid.y * size_sorted_axis;
-  dev_idxs += tid.y * size_sorted_axis;
+  block_partitions += tid.y * (n_blocks + 1);
+  dev_vals += int64_t(tid.y) * size_sorted_axis;
+  dev_idxs += int64_t(tid.y) * size_sorted_axis;
 
   for (int i = lid.x; i <= n_blocks; i += tgp_dims.x) {
     // Find location in merge step
@@ -618,10 +638,10 @@ mb_block_merge(
   using block_sort_t = typename sort_kernel::block_merge_sort_t;
 
   block_partitions += tid.y * (num_tiles + 1);
-  dev_vals_in += tid.y * size_sorted_axis;
-  dev_idxs_in += tid.y * size_sorted_axis;
-  dev_vals_out += tid.y * size_sorted_axis;
-  dev_idxs_out += tid.y * size_sorted_axis;
+  dev_vals_in += int64_t(tid.y) * size_sorted_axis;
+  dev_idxs_in += int64_t(tid.y) * size_sorted_axis;
+  dev_vals_out += int64_t(tid.y) * size_sorted_axis;
+  dev_idxs_out += int64_t(tid.y) * size_sorted_axis;
 
   int block_idx = tid.x;
   int merge_group = block_idx / merge_tiles;

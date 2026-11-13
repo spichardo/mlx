@@ -25,19 +25,14 @@ void concatenate_gpu(
 
   out.set_data(allocator::malloc(out.nbytes()));
 
-  auto strides = out.strides();
-  auto flags = out.flags();
-  flags.row_contiguous = false;
-  flags.col_contiguous = false;
-  flags.contiguous = false;
+  Shape start(out.ndim(), 0);
   auto& d = metal::device(s.device);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto concurrent_ctx = compute_encoder.start_concurrent();
   for (int i = 0; i < inputs.size(); i++) {
     array out_slice(inputs[i].shape(), out.dtype(), nullptr, {});
-    size_t data_offset = strides[axis] * sizes[i];
-    out_slice.copy_shared_buffer(
-        out, strides, flags, out_slice.size(), data_offset);
+    start[axis] = sizes[i];
+    slice_gpu(out, out_slice, start, Shape(out.ndim(), 1), s);
     copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
   }
 }
@@ -48,6 +43,14 @@ array compute_dynamic_offset(
     const std::vector<int>& axes,
     const Stream& s) {
   auto& d = metal::device(s.device);
+  auto& compute_encoder = metal::get_command_encoder(s);
+
+  // The kernel reads the indices contiguously
+  if (!indices.flags().row_contiguous) {
+    auto copy = contiguous_copy_gpu(indices, s);
+    compute_encoder.add_temporary(copy);
+    return compute_dynamic_offset(copy, strides, axes, s);
+  }
 
   // Kernel to compute offset here.
   array offset({1}, int64, nullptr, {});
@@ -57,8 +60,8 @@ array compute_dynamic_offset(
     offset.copy_shared_buffer(indices);
   } else {
     offset.set_data(allocator::malloc(offset.itemsize()));
+    compute_encoder.add_temporary(offset);
   }
-  d.add_temporary(offset, s.index);
 
   auto dtype = indices.dtype();
   std::string lib_name = "compute_dynamic_offset_" + type_to_name(dtype);
@@ -83,7 +86,6 @@ array compute_dynamic_offset(
   });
   auto kernel = d.get_kernel(lib_name, lib);
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
   compute_encoder.set_input_array(indices, 0);
   compute_encoder.set_output_array(offset, 1);

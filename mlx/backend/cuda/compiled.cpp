@@ -36,14 +36,16 @@ struct FusedKernelBuilder {
       params.push_back(
           fmt::format("const {}* {}", dtype_to_cuda_type(x.dtype()), xname));
       if (!is_scalar(x) && !contiguous) {
-        params.push_back(fmt::format(
-            "const __grid_constant__ cuda::std::array<int64_t, NDIM> {}_strides",
-            xname));
+        params.push_back(
+            fmt::format(
+                "const __grid_constant__ cuda::std::array<int64_t, NDIM> {}_strides",
+                xname));
       }
     }
     for (const auto& x : outputs) {
-      params.push_back(fmt::format(
-          "{}* {}", dtype_to_cuda_type(x.dtype()), namer.get_name(x)));
+      params.push_back(
+          fmt::format(
+              "{}* {}", dtype_to_cuda_type(x.dtype()), namer.get_name(x)));
     }
     if (!contiguous) {
       params.push_back(
@@ -218,8 +220,6 @@ constexpr const char* g_jit_includes = R"(
 #include "mlx/backend/cuda/device/utils.cuh"
 
 #include <cooperative_groups.h>
-
-#define inf cuda::std::numeric_limits<float>::infinity()
 )";
 
 void Compiled::eval_gpu(
@@ -237,7 +237,9 @@ void Compiled::eval_gpu(
   }
   int work_per_thread = 16 / max_size;
 
-  cu::JitModule& mod = cu::get_jit_module(s.device, lib_name(), [&]() {
+  auto& encoder = cu::get_command_encoder(s);
+
+  cu::JitModule& mod = cu::get_jit_module(encoder.device(), lib_name(), [&]() {
     // Build source code.
     cu::FusedKernelBuilder builder{
         g_jit_includes, lib_name(), inputs_, outputs_, tape_, is_constant_};
@@ -250,20 +252,30 @@ void Compiled::eval_gpu(
     builder.os += "\n} // namespace mlx::core::cu\n";
     // Build kernel names.
     std::vector<std::string> kernel_names;
-    kernel_names.push_back(fmt::format(
-        "mlx::core::cu::{}_contiguous<uint32_t, {}>",
-        lib_name(),
-        work_per_thread));
-    kernel_names.push_back(fmt::format(
-        "mlx::core::cu::{}_contiguous<int64_t, {}>",
-        lib_name(),
-        work_per_thread));
+    kernel_names.push_back(
+        fmt::format(
+            "mlx::core::cu::{}_contiguous<uint32_t, {}>",
+            lib_name(),
+            work_per_thread));
+    kernel_names.push_back(
+        fmt::format(
+            "mlx::core::cu::{}_contiguous<int64_t, {}>",
+            lib_name(),
+            work_per_thread));
     for (int wpt : {1, work_per_thread}) {
       for (int i = 1; i <= MAX_NDIM; ++i) {
-        kernel_names.push_back(fmt::format(
-            "mlx::core::cu::{}_strided<{}, uint32_t, {}>", lib_name(), i, wpt));
-        kernel_names.push_back(fmt::format(
-            "mlx::core::cu::{}_strided<{}, int64_t, {}>", lib_name(), i, wpt));
+        kernel_names.push_back(
+            fmt::format(
+                "mlx::core::cu::{}_strided<{}, uint32_t, {}>",
+                lib_name(),
+                i,
+                wpt));
+        kernel_names.push_back(
+            fmt::format(
+                "mlx::core::cu::{}_strided<{}, int64_t, {}>",
+                lib_name(),
+                i,
+                wpt));
       }
     }
 
@@ -273,11 +285,12 @@ void Compiled::eval_gpu(
 
   // Collapse contiguous dims to route to a faster kernel if possible. Also
   // handle all broadcasting.
-  auto [contiguous, shape, strides_vec] =
+  auto [contiguous, negative_strides, shape, strides_vec] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
 
-  // Whether to use large index.
-  bool large = compiled_use_large_index(inputs, outputs, contiguous);
+  // Whether to use large index (also true for negative strides).
+  bool large =
+      negative_strides || compiled_use_large_index(inputs, outputs, contiguous);
 
   cu::KernelArgs args;
   // Put inputs.
@@ -292,8 +305,6 @@ void Compiled::eval_gpu(
       args.append_ptr(strides_vec[strides_index++].data());
     }
   }
-
-  auto& encoder = cu::get_command_encoder(s);
 
   // Put outputs.
   compiled_allocate_outputs(
@@ -339,7 +350,8 @@ void Compiled::eval_gpu(
   auto [kernel, max_block_dims] = mod.get_kernel_and_dims(kernel_name);
   auto [num_blocks, block_dims] =
       get_launch_args(outputs[0], large, work_per_thread, max_block_dims);
-  encoder.add_kernel_node(kernel, num_blocks, block_dims, 0, args.args());
+  encoder.add_kernel_node_raw(
+      kernel, num_blocks, block_dims, {}, 0, args.args());
 }
 
 } // namespace mlx::core

@@ -1,5 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
+import concurrent.futures
+import gc
 import unittest
 
 import mlx.core as mx
@@ -111,6 +113,91 @@ class TestStream(mlx_tests.MLXTestCase):
         s_cpu = mx.new_stream(mx.cpu)
         b = mx.add(x, y, stream=s_cpu)
         self.assertEqual(a.item(), b.item())
+
+    def test_reentrant_stream_context(self):
+        default = mx.default_stream(mx.default_device())
+        s = mx.new_stream(mx.default_device())
+        context = mx.stream(s)
+
+        with context:
+            with context:
+                self.assertEqual(mx.default_stream(mx.default_device()), s)
+            self.assertEqual(mx.default_stream(mx.default_device()), s)
+        self.assertEqual(mx.default_stream(mx.default_device()), default)
+
+    def test_stream_context_exited_on_another_thread(self):
+        # A generator suspended inside `mx.stream(...)` and abandoned is
+        # finalized by the GC on whatever thread drops the last reference.
+        # Restoring there would install a foreign, thread-affine stream as
+        # that thread's default and break every later op on it.
+        abandoned = {}
+
+        def on_worker():
+            def gen():
+                try:
+                    with mx.stream(mx.new_stream(mx.default_device())):
+                        yield 1
+                        yield 2
+                except Exception:
+                    # Exception is ignored on purpose.
+                    pass
+
+            g = gen()
+            next(g)
+            abandoned["gen"] = g
+
+        before = mx.default_stream(mx.default_device())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(on_worker).result()
+
+        del abandoned["gen"]
+        gc.collect()
+
+        self.assertEqual(mx.default_stream(mx.default_device()), before)
+        mx.eval(mx.add(mx.array(1.0), mx.array(1.0)))
+
+
+class TestDeviceInfo(mlx_tests.MLXTestCase):
+    def test_device_count(self):
+        cpu_count = mx.device_count(mx.cpu)
+        self.assertIsInstance(cpu_count, int)
+        self.assertEqual(cpu_count, 1)
+
+        gpu_count = mx.device_count(mx.gpu)
+        self.assertIsInstance(gpu_count, int)
+        self.assertGreaterEqual(gpu_count, 0)
+
+    def test_device_info_cpu(self):
+        info = mx.device_info(mx.cpu)
+        self.assertIsInstance(info, dict)
+        self.assertIn("device_name", info)
+        self.assertTrue(len(info["device_name"]) > 0)
+        self.assertIn("architecture", info)
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU is not available")
+    def test_device_info_gpu(self):
+        gpu_count = mx.device_count(mx.gpu)
+        for i in range(gpu_count):
+            info = mx.device_info(mx.Device(mx.gpu, i))
+            self.assertIsInstance(info, dict)
+            self.assertIn("device_name", info)
+            self.assertTrue(len(info["device_name"]) > 0)
+            self.assertIn("architecture", info)
+
+    def test_cuda_get_arch_list(self):
+        arch_list = mx.cuda.get_arch_list()
+        self.assertIsInstance(arch_list, list)
+        if mx.cuda.is_available():
+            self.assertTrue(arch_list)
+            for arch in arch_list:
+                self.assertRegex(arch, r"^(sm|compute)_[0-9]+[af]?$")
+        else:
+            self.assertEqual(arch_list, [])
+
+    def test_device_info_default(self):
+        info = mx.device_info()
+        self.assertIsInstance(info, dict)
+        self.assertIn("device_name", info)
 
 
 if __name__ == "__main__":

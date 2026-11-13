@@ -273,8 +273,26 @@ std::pair<Dtype, Dtype> remap_reduce_types(
     }
     return {in.dtype(), in.dtype()};
   } else if (op_name == "and" || op_name == "or") {
-    if (in.dtype().size() == 1) {
+    // Integers can be tested as whatever type has the same width, since only
+    // their bits matter. Floats cannot: -0.0 compares equal to zero but has a
+    // bit set, so it has to be tested as a float.
+    switch (in.dtype()) {
+      case float16:
+        return {float16, bool_};
+      case bfloat16:
+        return {bfloat16, bool_};
+      case float32:
+        return {float32, bool_};
+      case complex64:
+        return {complex64, bool_};
+      default:
+        break;
+    }
+    if (in.dtype() == bool_) {
       return {bool_, bool_};
+    } else if (in.dtype().size() == 1) {
+      // A Metal bool must hold 0 or 1, so read int8 and uint8 as int8.
+      return {int8, bool_};
     } else if (in.dtype().size() == 2) {
       return {int16, bool_};
     } else if (in.dtype().size() == 4) {
@@ -292,16 +310,18 @@ void init_reduce(
     CommandEncoder& compute_encoder,
     metal::Device& d,
     const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
   auto [_, out_type] = remap_reduce_types(out, op_name);
   const std::string func_name = "init_reduce";
   std::string kname = func_name;
   concatenate(kname, "_", op_name, type_to_name(out_type));
   auto kernel = get_reduce_init_kernel(d, kname, func_name, op_name, out_type);
-  size_t nthreads = out.size();
-  MTL::Size grid_dims = MTL::Size(nthreads, 1, 1);
+  MTL::Size grid_dims = get_2d_grid_dims(out.shape(), out.strides());
   NS::UInteger thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
-  if (thread_group_size > nthreads) {
-    thread_group_size = nthreads;
+  if (thread_group_size > grid_dims.width) {
+    thread_group_size = grid_dims.width;
   }
   MTL::Size group_dims = MTL::Size(thread_group_size, 1, 1);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -358,7 +378,7 @@ void all_reduce_dispatch(
     // Allocate an intermediate tensor to hold results if needed
     array intermediate({n_rows}, out_type, nullptr, {});
     intermediate.set_data(allocator::malloc(intermediate.nbytes()));
-    d.add_temporary(intermediate, s.index);
+    compute_encoder.add_temporary(intermediate);
 
     // 1st pass
     size_t row_size = (in_size + n_rows - 1) / n_rows;
@@ -403,7 +423,7 @@ void row_reduce_small(
   auto [in_type, out_type] = remap_reduce_types(in, op_name);
   const std::string func_name = "row_reduce_small";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -500,7 +520,7 @@ void row_reduce_looped(
   int n = get_kernel_reduce_ndim(args.reduce_ndim);
   const std::string func_name = "row_reduce_looped";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -584,7 +604,7 @@ void strided_reduce_small(
   int n = get_kernel_reduce_ndim(args.reduce_ndim);
   const std::string func_name = "col_reduce_small";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -652,7 +672,7 @@ void strided_reduce_longcolumn(
       intermediate_shape.end(), out.shape().begin(), out.shape().end());
   array intermediate(std::move(intermediate_shape), out_type, nullptr, {});
   intermediate.set_data(allocator::malloc(intermediate.nbytes()));
-  d.add_temporary(intermediate, s.index);
+  compute_encoder.add_temporary(intermediate);
 
   // Prepare the arguments for the kernel
   args.reduce_shape.push_back(args.reduction_size);
@@ -675,7 +695,7 @@ void strided_reduce_longcolumn(
   int n = get_kernel_reduce_ndim(args.reduce_ndim);
   std::string func_name = "col_reduce_longcolumn";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -710,8 +730,7 @@ void strided_reduce_longcolumn(
   second_args.reduce_strides.push_back(out.size());
   second_args.reduce_ndim++;
   int BN = 32;
-  grid_dims = MTL::Size(256 * ((out.size() + BN - 1) / BN), 1, 1);
-  group_dims = MTL::Size(256, 1, 1);
+  int threadgroup_size = 256;
 
   // Set the 2nd kernel
   func_name = "col_reduce_looped";
@@ -737,7 +756,11 @@ void strided_reduce_longcolumn(
   compute_encoder.set_input_array(intermediate, 0);
   compute_encoder.set_output_array(out, 1);
   second_args.encode(compute_encoder);
-  compute_encoder.dispatch_threads(grid_dims, group_dims);
+  dispatch_threadgroups_in_slices(
+      compute_encoder,
+      (out.size() + BN - 1) / BN,
+      threadgroup_size,
+      [&](int64_t block) { compute_encoder.set_bytes(block * BN, 11); });
 }
 
 void strided_reduce_looped(
@@ -760,17 +783,12 @@ void strided_reduce_looped(
   int BN = 32;
   int BM = 1024 / BN;
   int threadgroup_size = 8 * 32;
-  MTL::Size grid_dims(
-      threadgroup_size * ((args.reduction_stride + BN - 1) / BN),
-      out_grid_size.width,
-      out_grid_size.height);
-  MTL::Size group_dims(threadgroup_size, 1, 1);
 
   // Set the kernel
   int n = get_kernel_reduce_ndim(args.reduce_ndim);
   std::string func_name = "col_reduce_looped";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -802,7 +820,13 @@ void strided_reduce_looped(
   compute_encoder.set_input_array(in, 0);
   compute_encoder.set_output_array(out, 1);
   args.encode(compute_encoder);
-  compute_encoder.dispatch_threads(grid_dims, group_dims);
+  dispatch_threadgroups_in_slices(
+      compute_encoder,
+      (args.reduction_stride + BN - 1) / BN,
+      threadgroup_size,
+      [&](int64_t block) { compute_encoder.set_bytes(block * BN, 11); },
+      out_grid_size.width,
+      out_grid_size.height);
 }
 
 void strided_reduce_2pass(
@@ -823,7 +847,7 @@ void strided_reduce_2pass(
       intermediate_shape.end(), out.shape().begin(), out.shape().end());
   array intermediate(std::move(intermediate_shape), out_type, nullptr, {});
   intermediate.set_data(allocator::malloc(intermediate.nbytes()));
-  d.add_temporary(intermediate, s.index);
+  compute_encoder.add_temporary(intermediate);
 
   // Prepare the arguments for the kernel
   args.reduce_shape.push_back(args.reduction_size);
@@ -837,17 +861,12 @@ void strided_reduce_2pass(
   int BN = 32;
   int BM = 1024 / BN;
   int threadgroup_size = 8 * 32;
-  MTL::Size grid_dims(
-      threadgroup_size * ((args.reduction_stride + BN - 1) / BN),
-      out_grid_size.width * outer_blocks,
-      out_grid_size.height);
-  MTL::Size group_dims(threadgroup_size, 1, 1);
 
   // Set the kernel
   int n = get_kernel_reduce_ndim(args.reduce_ndim);
   std::string func_name = "col_reduce_2pass";
   std::string kname = func_name;
-  bool large = in.size() > INT32_MAX;
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
   if (large) {
     kname += "_large";
   }
@@ -879,15 +898,20 @@ void strided_reduce_2pass(
   compute_encoder.set_input_array(in, 0);
   compute_encoder.set_output_array(intermediate, 1);
   args.encode(compute_encoder);
-  compute_encoder.set_bytes(out_size, 11);
-  compute_encoder.dispatch_threads(grid_dims, group_dims);
+  compute_encoder.set_bytes(out_size, 12);
+  dispatch_threadgroups_in_slices(
+      compute_encoder,
+      (args.reduction_stride + BN - 1) / BN,
+      threadgroup_size,
+      [&](int64_t block) { compute_encoder.set_bytes(block * BN, 11); },
+      out_grid_size.width * outer_blocks,
+      out_grid_size.height);
 
   // Make the 2nd pass arguments and grid_dims
   ColReduceArgs second_args(intermediate);
   second_args.reduce_shape.push_back(outer_blocks);
   second_args.reduce_strides.push_back(out.size());
   second_args.reduce_ndim++;
-  grid_dims = MTL::Size(threadgroup_size * ((out.size() + BN - 1) / BN), 1, 1);
 
   // Set the 2nd kernel
   func_name = "col_reduce_looped";
@@ -913,7 +937,11 @@ void strided_reduce_2pass(
   compute_encoder.set_input_array(intermediate, 0);
   compute_encoder.set_output_array(out, 1);
   second_args.encode(compute_encoder);
-  compute_encoder.dispatch_threads(grid_dims, group_dims);
+  dispatch_threadgroups_in_slices(
+      compute_encoder,
+      (out.size() + BN - 1) / BN,
+      threadgroup_size,
+      [&](int64_t block) { compute_encoder.set_bytes(block * BN, 11); });
 }
 
 void strided_reduce_general_dispatch(
@@ -952,9 +980,17 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   array in = inputs[0];
 
-  // Make sure no identity reductions trickle down here
   assert(!axes_.empty());
-  assert(out.size() != in.size());
+
+  // When all the reduced axes have size 1 at runtime, which can happen with
+  // shapeless compilation, the reduction is the identity so just cast-copy
+  // the input to the output.
+  if (in.size() > 0 && out.size() == in.size()) {
+    CopyType ctype =
+        in.flags().contiguous ? CopyType::Vector : CopyType::General;
+    copy_gpu(in, out, ctype, stream());
+    return;
+  }
 
   // Continue with reduction operation
   // Minimum of 4 bytes since we use size 4 structs for all reduce
@@ -986,7 +1022,7 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Initialize output
   auto& s = stream();
   auto& d = metal::device(s.device);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
 
   // Reduce
   if (in.size() > 0) {
@@ -1000,7 +1036,7 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
     //       stride.
     if (plan.type == GeneralReduce) {
       array in_copy = contiguous_copy_gpu(in, s);
-      d.add_temporary(in_copy, s.index);
+      compute_encoder.add_temporary(in_copy);
       in = in_copy;
       plan = get_reduction_plan(in, axes_);
     }

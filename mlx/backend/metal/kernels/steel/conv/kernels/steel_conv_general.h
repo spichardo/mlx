@@ -13,7 +13,7 @@ template <
     int WN,
     typename AccumType = float,
     typename Epilogue = TransformNone<T, AccumType>>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 implicit_gemm_conv_2d_general(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
@@ -186,7 +186,7 @@ implicit_gemm_conv_2d_general(
     if (offset_n >= gemm_params->N)
       return;
 
-    short diff = gemm_params->N - offset_n;
+    int diff = gemm_params->N - offset_n;
 
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < mma_t::TM; i++) {
@@ -200,14 +200,14 @@ implicit_gemm_conv_2d_general(
           (hw % jump_params->adj_out_w) * jump_params->f_out_jump_w + base_ow;
 
       if (n < params->N && oh < params->oS[0] && ow < params->oS[1]) {
-        int offset_cm = n * params->out_strides[0] +
+        size_t offset_cm = static_cast<size_t>(n) * params->out_strides[0] +
             oh * params->out_strides[1] + ow * params->out_strides[2];
 
         STEEL_PRAGMA_UNROLL
         for (int j = 0; j < mma_t::TN; j++) {
           // Get accumulated result and associated offset in C
           thread const auto& accum = mma_op.Ctile.frag_at(i, j);
-          int offset = offset_cm + (j * mma_t::TN_stride);
+          size_t offset = offset_cm + (j * mma_t::TN_stride);
 
           constexpr short kelems = decltype(mma_op.Ctile)::kElemsPerFrag;
 

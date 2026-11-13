@@ -8,6 +8,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cub/block/block_load.cuh>
+#include <cub/cub.cuh>
 
 namespace mlx::core {
 
@@ -281,8 +282,6 @@ void col_reduce_looped(
         using OP = MLX_GET_TYPE(reduce_type_tag);
         using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
-        // Cub doesn't like const pointers for vectorized loads. (sigh)
-        T* indata = const_cast<T*>(gpu_ptr<T>(in));
 
         constexpr int N_READS = 4;
         constexpr int BM = 32;
@@ -295,8 +294,7 @@ void col_reduce_looped(
             kernel,
             grid,
             blocks,
-            0,
-            indata,
+            gpu_ptr<T>(in),
             gpu_ptr<U>(out),
             static_cast<cu::ColReduceArgs>(args),
             out.size() / args.reduction_stride);
@@ -333,7 +331,6 @@ void col_reduce_small(
           kernel,
           grid,
           block,
-          0,
           gpu_ptr<T>(in),
           gpu_ptr<U>(out),
           static_cast<cu::ColReduceArgs>(args),
@@ -378,8 +375,7 @@ void col_reduce_two_pass(
       cu::malloc_async(intermediate.nbytes(), encoder),
       data_size,
       intermediate_strides,
-      fl,
-      allocator::free);
+      fl);
 
   encoder.add_temporary(intermediate);
   encoder.set_input_array(in);
@@ -390,8 +386,6 @@ void col_reduce_two_pass(
         using OP = MLX_GET_TYPE(reduce_type_tag);
         using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
-        // Cub doesn't like const pointers for vectorized loads. (sigh)
-        T* indata = const_cast<T*>(gpu_ptr<T>(in));
 
         constexpr int N_READS = 4;
         constexpr int BM = 32;
@@ -404,8 +398,7 @@ void col_reduce_two_pass(
             kernel,
             grid,
             blocks,
-            0,
-            indata,
+            gpu_ptr<T>(in),
             gpu_ptr<U>(intermediate),
             static_cast<cu::ColReduceArgs>(args),
             out.size() / args.reduction_stride);
@@ -443,7 +436,6 @@ void col_reduce_two_pass(
             kernel,
             grid,
             blocks,
-            0,
             gpu_ptr<T>(intermediate),
             gpu_ptr<U>(out),
             second_args,

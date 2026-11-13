@@ -87,10 +87,57 @@ __global__ void prepare_grouped_mm_data(
     out_lds[group] = N;
     // Fill pointers.
     auto offset = group == 0 ? 0 : cum_histo[group - 1];
-    a_ptrs[group] = a_start + offset * item_size * a_batch_stride;
-    b_ptrs[group] = b_start + group * item_size * b_batch_stride;
-    out_ptrs[group] = out_start + offset * item_size * out_batch_stride;
+    a_ptrs[group] =
+        a_start + static_cast<int64_t>(offset) * item_size * a_batch_stride;
+    b_ptrs[group] =
+        b_start + static_cast<int64_t>(group) * item_size * b_batch_stride;
+    out_ptrs[group] =
+        out_start + static_cast<int64_t>(offset) * item_size * out_batch_stride;
   }
+}
+
+__global__ void prepare_segmented_mm_data(
+    const uint32_t* segments,
+    int num_segments,
+    int M,
+    int N,
+    int lda,
+    int ldb,
+    int item_size,
+    bool a_transposed,
+    bool b_transposed,
+    int8_t* a_start,
+    int8_t* b_start,
+    int8_t* out_start,
+    ProblemSize* problem_sizes,
+    int64_t* a_lds,
+    int64_t* b_lds,
+    int64_t* out_lds,
+    void** a_ptrs,
+    void** b_ptrs,
+    void** out_ptrs) {
+  int idx = cg::this_grid().thread_rank();
+  if (idx >= num_segments)
+    return;
+
+  int64_t start = segments[2 * idx];
+  int64_t end = segments[2 * idx + 1];
+  int K_i = (end > start) ? static_cast<int>(end - start) : 0;
+
+  problem_sizes[idx] = {M, N, K_i};
+  a_lds[idx] = lda;
+  b_lds[idx] = ldb;
+  out_lds[idx] = N;
+
+  // Offset into K dimension depends on layout:
+  // A [M,K]: row-major offset = start, col-major offset = start * lda
+  // B [K,N]: row-major offset = start * ldb, col-major offset = start
+  int64_t a_offset = a_transposed ? start * lda : start;
+  int64_t b_offset = b_transposed ? start : start * ldb;
+
+  a_ptrs[idx] = a_start + a_offset * item_size;
+  b_ptrs[idx] = b_start + b_offset * item_size;
+  out_ptrs[idx] = out_start + static_cast<int64_t>(idx) * M * N * item_size;
 }
 
 } // namespace cu
@@ -124,12 +171,12 @@ struct GemmConfiguration : public CommonGemmConfiguration<T, Arch, 1> {
 };
 
 // Specialized GEMM configuration for sm80 and later.
-template <typename T, typename Arch, int kAlignmentC, bool kEnableTF32>
+template <typename T, typename Arch, int kAlignmentC>
 struct GemmConfiguration<
     T,
     Arch,
     kAlignmentC,
-    kEnableTF32,
+    true,
     std::enable_if_t<Arch::kMinComputeCapability >= 80 && sizeof(T) <= 4>>
     : public CommonGemmConfiguration<T, cutlass::arch::Sm80, kAlignmentC> {
   using OpClass = cutlass::arch::OpClassTensorOp;
@@ -158,10 +205,11 @@ class GemmGroupedEncoder
     : public cutlass::gemm::device::GemmGrouped<GemmKernel> {
  public:
   void encode(cu::CommandEncoder& encoder) {
-    encoder.add_kernel_node(
+    encoder.add_kernel_node_ex(
         cutlass::Kernel<GemmKernel>,
         {static_cast<uint32_t>(this->params_.threadblock_count), 1, 1},
         {GemmKernel::kThreadCount, 1, 1},
+        {},
         sizeof(typename GemmKernel::SharedStorage),
         this->params_);
   }
@@ -200,7 +248,7 @@ void grouped_gemm_v2(
           LayoutB,
           cutlass::ComplexTransform::kNone,
           GemmConfiguration::kAlignmentAB,
-          typename GemmConfiguration::Element,
+          typename GemmConfiguration::Accumulator,
           cutlass::layout::RowMajor,
           typename GemmConfiguration::Accumulator,
           typename GemmConfiguration::OpClass,
@@ -280,6 +328,11 @@ void cutlass_grouped_gemm_unaligned(
     const array& indices,
     array& out,
     cu::CommandEncoder& encoder) {
+  if (group_count > 1024) {
+    throw std::runtime_error(
+        "[gather_mm] Group count can not be larger than 1024.");
+  }
+
   int K = a.shape(-1);
   int N = b.shape(-1);
 
@@ -309,10 +362,11 @@ void cutlass_grouped_gemm_unaligned(
 
   encoder.set_input_array(indices);
   encoder.set_output_array(gemm_args);
-  encoder.add_kernel_node(
+  encoder.add_kernel_node_ex(
       cu::prepare_grouped_mm_data<N_READS>,
       num_blocks,
       block_dims,
+      {},
       group_count * sizeof(uint32_t), // sizeof(cum_histo)
       gpu_ptr<uint32_t>(indices),
       indices.size(),
@@ -345,6 +399,87 @@ void cutlass_grouped_gemm_unaligned(
   fun(a_transposed,
       b_transposed,
       group_count,
+      problem_sizes,
+      a_lds,
+      b_lds,
+      out_lds,
+      a_ptrs,
+      b_ptrs,
+      out_ptrs,
+      encoder);
+}
+
+void cutlass_segmented_mm(
+    bool a_transposed,
+    int lda,
+    bool b_transposed,
+    int ldb,
+    int num_segments,
+    int M,
+    int N,
+    const array& a,
+    const array& b,
+    const array& segments,
+    array& out,
+    cu::CommandEncoder& encoder) {
+  // Allocate grouped GEMM args on device.
+  int problem_sizes_nbytes =
+      num_segments * cuda::ceil_div(sizeof(ProblemSize), 8) * 8;
+  int nbytes = problem_sizes_nbytes +
+      num_segments * (3 * sizeof(void*) + 3 * sizeof(int64_t));
+  nbytes = cuda::ceil_div(nbytes, 256) * 256;
+  array gemm_args(cu::malloc_async(nbytes, encoder), {nbytes}, int8);
+  encoder.add_temporary(gemm_args);
+
+  ProblemSize* problem_sizes = gpu_ptr<ProblemSize>(gemm_args);
+  int64_t* a_lds = gpu_ptr<int64_t>(gemm_args) + problem_sizes_nbytes / 8;
+  int64_t* b_lds = a_lds + num_segments;
+  int64_t* out_lds = b_lds + num_segments;
+  void** a_ptrs = reinterpret_cast<void**>(out_lds + num_segments);
+  void** b_ptrs = a_ptrs + num_segments;
+  void** out_ptrs = b_ptrs + num_segments;
+
+  // Build problem descriptions from segments on the GPU.
+  int block_size = std::min(num_segments, 256);
+  int num_blocks = cuda::ceil_div(num_segments, block_size);
+
+  encoder.set_input_array(segments);
+  encoder.set_output_array(gemm_args);
+  encoder.add_kernel_node_ex(
+      cu::prepare_segmented_mm_data,
+      dim3(num_blocks),
+      dim3(block_size),
+      {},
+      0,
+      gpu_ptr<uint32_t>(segments),
+      num_segments,
+      M,
+      N,
+      static_cast<int>(lda),
+      static_cast<int>(ldb),
+      static_cast<int>(out.itemsize()),
+      a_transposed,
+      b_transposed,
+      gpu_ptr<int8_t>(a),
+      gpu_ptr<int8_t>(b),
+      gpu_ptr<int8_t>(out),
+      problem_sizes,
+      a_lds,
+      b_lds,
+      out_lds,
+      a_ptrs,
+      b_ptrs,
+      out_ptrs);
+
+  // Dispatch grouped GEMM.
+  encoder.set_input_array(a);
+  encoder.set_input_array(b);
+  encoder.set_input_array(gemm_args);
+  encoder.set_output_array(out);
+  auto* fun = get_grouped_mm_funcion(a.dtype(), N, encoder.device());
+  fun(a_transposed,
+      b_transposed,
+      num_segments,
       problem_sizes,
       a_lds,
       b_lds,

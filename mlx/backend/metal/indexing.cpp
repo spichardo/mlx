@@ -3,13 +3,15 @@
 #include <fmt/format.h>
 
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/common/slicing.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/gpu/scan.h"
+#include "mlx/backend/gpu/slicing.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/jit/indexing.h"
 #include "mlx/backend/metal/kernels.h"
-#include "mlx/backend/metal/scan.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/dtype.h"
 #include "mlx/primitives.h"
@@ -36,6 +38,28 @@ std::pair<std::string, std::string> make_index_args(
   return {idx_args.str(), idx_arr.str()};
 }
 
+// The 64-bit path must cover both the logical size and the span reachable
+// through the strides (views) or a smaller span (broadcast arrays).
+inline bool exceeds_int32(const array& a) {
+  return a.size() > INT32_MAX || a.data_size() > INT32_MAX;
+}
+
+template <typename T>
+inline std::string make_op(typename T::ReduceType r, const std::string& dt) {
+  switch (r) {
+    case T::None:
+      return "None";
+    case T::Sum:
+      return fmt::format("Sum<{0}>", dt);
+    case T::Prod:
+      return fmt::format("Prod<{0}>", dt);
+    case T::Max:
+      return fmt::format("Max<{0}>", dt);
+    case T::Min:
+      return fmt::format("Min<{0}>", dt);
+  }
+}
+
 void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& src = inputs[0];
   int nidx = inputs.size() - 1;
@@ -60,8 +84,11 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
     slice_size *= s;
   }
 
-  bool large_index = nidx && inputs[1].size() > INT32_MAX;
-  bool large_src = src.size() > INT32_MAX;
+  bool large_index = false;
+  for (int i = 1; i <= nidx; ++i) {
+    large_index |= exceeds_int32(inputs[i]);
+  }
+  bool large_src = exceeds_int32(src);
   bool large_out = out.size() > INT32_MAX;
   bool large = large_index || large_src || large_out;
 
@@ -93,7 +120,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       return kernel_source;
     });
 
-    auto& compute_encoder = d.get_command_encoder(s.index);
+    auto& compute_encoder = metal::get_command_encoder(s);
     auto kernel = d.get_kernel(kernel_name, lib);
     compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -146,7 +173,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
     return kernel_source;
   });
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kernel_name, lib);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -194,9 +221,6 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   compute_encoder.set_vector_bytes(axes_, 6);
 
   // Set index info
-  //
-  // We don't need to check for empty idx_shapes because gather has a
-  // idx_ndim == 0 specialization
   compute_encoder.set_vector_bytes(idx_shapes, 7);
   compute_encoder.set_vector_bytes(idx_strides, 8);
   compute_encoder.set_vector_bytes(idx_contigs, 9);
@@ -212,7 +236,8 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (size_of(out.dtype()) == 8) {
+  if (size_of(out.dtype()) == 8 &&
+      !(out.dtype() == complex64 && reduce_type_ == Scatter::Sum)) {
     std::ostringstream msg;
     msg << "[Scatter::eval_gpu] Does not support " << out.dtype();
     throw std::invalid_argument(msg.str());
@@ -286,8 +311,11 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
   auto upd_contig = upd.flags().row_contiguous;
   bool large_out = out.size() > INT32_MAX;
-  bool large_idx = nidx && (inputs[1].size() > INT32_MAX);
-  bool large_upd = upd.size() > INT32_MAX;
+  bool large_idx = false;
+  for (int i = 1; i <= nidx; ++i) {
+    large_idx |= exceeds_int32(inputs[i]);
+  }
+  bool large_upd = exceeds_int32(upd);
   bool large = large_out || large_idx || large_upd;
   std::string kernel_name = fmt::format(
       "scatter{0}{1}_{2}_{3}_{4}_nwork{5}_{6}",
@@ -307,27 +335,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
     std::string out_type_str = get_type_string(out.dtype());
     std::string idx_type_str =
         nidx ? get_type_string(inputs[1].dtype()) : "bool";
-    std::string op_type;
-    switch (reduce_type_) {
-      case Scatter::None:
-        op_type = "None";
-        break;
-      case Scatter::Sum:
-        op_type = "Sum<{0}>";
-        break;
-      case Scatter::Prod:
-        op_type = "Prod<{0}>";
-        break;
-      case Scatter::Max:
-        op_type = "Max<{0}>";
-        break;
-      case Scatter::Min:
-        op_type = "Min<{0}>";
-        break;
-    }
-    if (reduce_type_ != Scatter::None) {
-      op_type = fmt::format(fmt::runtime(op_type), out_type_str);
-    }
+    std::string op_type = make_op<Scatter>(reduce_type_, out_type_str);
     auto [idx_args, idx_arr] = make_index_args(idx_type_str, nidx);
 
     kernel_source += fmt::format(
@@ -345,7 +353,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
     return kernel_source;
   });
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kernel_name, lib);
 
   size_t nthreads = upd.size();
@@ -380,42 +388,19 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
     idx_contigs.push_back(inputs[i + 1].flags().row_contiguous);
   }
 
-  if (upd_ndim == 0) {
-    // Need placeholders so Metal doesn't complain
-    int shape_ = 0;
-    int64_t stride_ = 0;
-    compute_encoder.set_bytes(shape_, 3);
-    compute_encoder.set_bytes(stride_, 4);
-  } else {
-    compute_encoder.set_vector_bytes(upd.shape(), 3);
-    compute_encoder.set_vector_bytes(upd.strides(), 4);
-  }
+  compute_encoder.set_vector_bytes(upd.shape(), 3);
+  compute_encoder.set_vector_bytes(upd.strides(), 4);
   compute_encoder.set_bytes(upd_ndim, 5);
   compute_encoder.set_bytes(upd_size, 6);
 
   // Set output info
   size_t out_ndim = out.ndim();
-  if (out_ndim == 0) {
-    // Need placeholders so Metal doesn't complain
-    int shape_ = 0;
-    int64_t stride_ = 0;
-    compute_encoder.set_bytes(shape_, 7);
-    compute_encoder.set_bytes(stride_, 8);
-  } else {
-    compute_encoder.set_vector_bytes(out.shape(), 7);
-    compute_encoder.set_vector_bytes(out.strides(), 8);
-  }
+  compute_encoder.set_vector_bytes(out.shape(), 7);
+  compute_encoder.set_vector_bytes(out.strides(), 8);
   compute_encoder.set_bytes(out_ndim, 9);
-  compute_encoder.set_vector_bytes(axes_, 10);
 
   // Set index info
-  if (idx_ndim == 0) {
-    // Add a 0 in idx_shapes and strides to avoid the missing buffer binding
-    // error in the metal API.
-    idx_shapes.push_back(0);
-    idx_strides.push_back(0);
-    idx_contigs.push_back(false);
-  }
+  compute_encoder.set_vector_bytes(axes_, 10);
   compute_encoder.set_vector_bytes(idx_shapes, 11);
   compute_encoder.set_vector_bytes(idx_strides, 12);
   compute_encoder.set_vector_bytes(idx_contigs, 13);
@@ -453,7 +438,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   size_t ndim = src.ndim();
 
-  bool large = idx.size() > INT32_MAX || src.size() > INT32_MAX;
+  bool large = exceeds_int32(idx) || exceeds_int32(src);
 
   std::string kernel_name = fmt::format(
       "gather_axis{0}{1}_{2}",
@@ -484,7 +469,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
     return kernel_source;
   });
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kernel_name, lib);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -521,6 +506,13 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (size_of(out.dtype()) == 8 &&
+      !(out.dtype() == complex64 && reduce_type_ == ScatterAxis::Sum)) {
+    std::ostringstream msg;
+    msg << "[ScatterAxis::eval_gpu] Does not support " << out.dtype();
+    throw std::invalid_argument(msg.str());
+  }
+
   auto& src = inputs[0];
   auto& idx = inputs[1];
   auto& upd = inputs[2];
@@ -546,7 +538,8 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   size_t ndim = src.ndim();
 
-  bool large = idx.size() > INT32_MAX || src.size() > INT32_MAX;
+  bool large =
+      exceeds_int32(idx) || src.size() > INT32_MAX || exceeds_int32(upd);
 
   std::string op_name;
   switch (reduce_type_) {
@@ -600,7 +593,7 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
     return kernel_source;
   });
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kernel_name, lib);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -651,6 +644,7 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto& s = stream();
   auto& d = metal::device(s.device);
+  auto& compute_encoder = metal::get_command_encoder(s);
 
   const size_t total = mask.size();
   const CopyType ct = (total == 1)
@@ -661,20 +655,18 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  array mask_flat = flatten_in_eval(mask, 1, -1, s);
-  if (mask_flat.data<void>() != mask.data<void>()) {
-    d.add_temporary(mask_flat, s.index);
-  }
-
+  array mask_flat = (mask.ndim() == 1)
+      ? reshape_in_eval(mask, {mask.shape(0), 1}, s)
+      : flatten_in_eval(mask, 1, -1, s);
   if (!mask_flat.flags().row_contiguous) {
     mask_flat = contiguous_copy_gpu(mask_flat, s);
-    d.add_temporary(mask_flat, s.index);
+    compute_encoder.add_temporary(mask_flat);
   }
 
   // Prefix (exclusive) of mask → scatter_offsets
   array scatter_offsets(mask_flat.shape(), uint32, nullptr, {});
   scatter_offsets.set_data(allocator::malloc(scatter_offsets.nbytes()));
-  d.add_temporary(scatter_offsets, s.index);
+  compute_encoder.add_temporary(scatter_offsets);
 
   scan_gpu_inplace(
       mask_flat,
@@ -706,7 +698,6 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Binding
   int bind_idx = 0;
   const int ndim = static_cast<int>(src.ndim());
-  auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
   compute_encoder.set_input_array(mask_flat, bind_idx++);
   compute_encoder.set_input_array(scatter_offsets, bind_idx++);
@@ -721,6 +712,153 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Dispatch
   auto group_dims = get_block_dims(total, 1, 1);
   MTL::Size grid_dims(total, 1, 1);
+  compute_encoder.dispatch_threads(grid_dims, group_dims);
+}
+
+void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 2);
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+
+  if (upd.size() == 0) {
+    out.copy_shared_buffer(in);
+    return;
+  }
+
+  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+      ? CopyType::Vector
+      : CopyType::General;
+  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  auto [data_offset, out_strides] =
+      prepare_slice(out, start_indices_, strides_);
+
+  // Do copy
+  if (reduce_type_ == SliceUpdate::None) {
+    copy_gpu_inplace(
+        /* const array& src = */ upd,
+        /* array& dst = */ out,
+        /* const Shape& data_shape = */ upd.shape(),
+        /* const Strides& i_strides = */ upd.strides(),
+        /* const Strides& o_strides = */ out_strides,
+        /* int64_t i_offset = */ 0,
+        /* int64_t o_offset = */ data_offset,
+        /* CopyType ctype = */ CopyType::GeneralGeneral,
+        /* const Stream& s = */ stream());
+    return;
+  }
+
+  std::string op_name;
+  switch (reduce_type_) {
+    case SliceUpdate::None:
+      op_name = "none";
+      break;
+    case SliceUpdate::Sum:
+      op_name = "sum";
+      break;
+    case SliceUpdate::Prod:
+      op_name = "prod";
+      break;
+    case SliceUpdate::Max:
+      op_name = "max";
+      break;
+    case SliceUpdate::Min:
+      op_name = "min";
+      break;
+  }
+
+  bool upd_contiguous = upd.flags().row_contiguous;
+  bool upd_scalar = upd.data_size() == 1;
+
+  Shape shape;
+  std::vector<Strides> strides;
+  if (upd_scalar) {
+    std::tie(shape, strides) =
+        collapse_contiguous_dims(upd.shape(), {out_strides, out_strides});
+  } else {
+    std::tie(shape, strides) =
+        collapse_contiguous_dims(upd.shape(), {upd.strides(), out_strides});
+  }
+
+  int ndim_constant = shape.size();
+  if (ndim_constant > 3) {
+    ndim_constant = 0;
+  }
+
+  int nwork = 1;
+  if (shape.back() % 4 == 0) {
+    nwork = 4;
+  } else if (shape.back() % 2 == 0) {
+    nwork = 2;
+  }
+
+  auto [ds, rc, cc] = check_contiguity(shape, strides[1]);
+  bool out_contiguous = rc;
+  bool large = exceeds_int32(upd) || exceeds_int32(out);
+  std::string kernel_name = fmt::format(
+      "slice_update_{0}_{1}{2}_{3}_{4}_{5}_nw{6}_nd{7}",
+      op_name,
+      type_to_name(out),
+      large ? "int64_t" : "int",
+      out_contiguous ? "oc_true" : "oc_false",
+      upd_contiguous ? "updc_true" : "updc_false",
+      upd_scalar ? "upds_true" : "upds_false",
+      nwork,
+      ndim_constant);
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::string kernel_source = metal::utils();
+    concatenate(kernel_source, metal::reduce_utils(), metal::scatter());
+
+    std::string out_type = get_type_string(out.dtype());
+    std::string op_type = make_op<SliceUpdate>(reduce_type_, out_type);
+
+    kernel_source += fmt::format(
+        slice_update_op_kernel,
+        kernel_name,
+        out_type,
+        large ? "int64_t" : "int",
+        op_type,
+        out_contiguous,
+        upd_contiguous,
+        upd_scalar,
+        nwork,
+        ndim_constant);
+
+    return kernel_source;
+  });
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kernel_name, lib);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set all the buffers
+  int ndim = shape.size();
+  int64_t size = upd.size();
+  compute_encoder.set_input_array(upd, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_vector_bytes(shape, 2);
+  compute_encoder.set_vector_bytes(strides[0], 3);
+  compute_encoder.set_bytes(ndim, 4);
+  compute_encoder.set_bytes(size, 5);
+  compute_encoder.set_vector_bytes(strides[1], 6);
+  compute_encoder.set_bytes(data_offset, 7);
+
+  // Launch grid
+  int64_t dim0 = ndim > 0 ? shape[ndim - 1] : 1;
+  int64_t dim1 = ndim > 1 ? shape[ndim - 2] : 1;
+  int64_t rest = size / (dim0 * dim1);
+  dim0 /= nwork;
+
+  auto group_dims = get_block_dims(dim0, dim1, rest);
+  MTL::Size grid_dims(dim0, dim1, rest);
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 

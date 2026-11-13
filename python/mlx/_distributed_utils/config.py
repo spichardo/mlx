@@ -10,16 +10,13 @@ from dataclasses import dataclass
 from subprocess import DEVNULL, run
 from typing import Optional
 
-import mlx.core as mx
-
 from .common import (
     Host,
+    Hostfile,
     OptionalBoolAction,
     log,
     log_error,
     log_warning,
-    parse_hostfile,
-    parse_hostlist,
 )
 
 
@@ -70,9 +67,20 @@ def add_ips(hosts, verbose=False):
         log_warning("Could not extract ip for", h.ssh_hostname)
 
 
-def check_rdma(hosts, verbose=False):
+def save_hostfile(args, hostfile):
+    if args.output_hostfile:
+        with open(args.output_hostfile, "w") as f:
+            json.dump(hostfile.to_json(), f, indent=4)
+    else:
+        print("Hostfile")
+        print("========")
+        print(json.dumps(hostfile.to_json(), indent=4))
+
+
+def check_rdma(hosts, verbose=False, strict=True):
     # Check whether the hosts are capable of RDMA over thunderbolt
-    warn = False
+    log_f = log_warning if not strict else log_error
+    failed = False
     for h in hosts:
         log(verbose, "Checking that", h.ssh_hostname, "supports RDMA")
         rdma_devs = (
@@ -82,26 +90,28 @@ def check_rdma(hosts, verbose=False):
         )
         rdma_devs = [d for d in rdma_devs if d.startswith("rdma_")]
         if not rdma_devs:
-            log_warning(h.ssh_hostname, "does not seem to have RDMA enabled")
-            warn = True
+            log_f(h.ssh_hostname, "does not seem to have RDMA enabled")
+            failed = True
 
-    if warn:
-        log_warning()
-        log_warning(
-            "Some of the hosts don't have RDMA enabled or they don't support RDMA."
-        )
-        log_warning()
-        log_warning(
-            "See https://ml-explore.github.io/mlx/build/html/usage/distributed.html"
-        )
-        log_warning("for instructions on how to enable RDMA.")
+    if failed:
+        log_f()
+        log_f("Some of the hosts don't have RDMA enabled or they don't support RDMA.")
+        log_f()
+        log_f("See https://ml-explore.github.io/mlx/build/html/usage/distributed.html")
+        log_f("for instructions on how to enable RDMA.")
+
+    if failed and strict:
+        sys.exit(1)
+
+    return not failed
 
 
 def can_auto_setup(hosts, sshinfo, auto_setup=False):
     has_sudo = all(info.has_sudo for info in sshinfo)
     if not has_sudo and auto_setup:
         log_warning(
-            "Automatic setup requested but the following hosts do not have passwordless sudo"
+            "Automatic setup requested but the following hosts do not have "
+            "passwordless sudo"
         )
         for h, i in zip(hosts, sshinfo):
             if not i.has_sudo:
@@ -177,11 +187,11 @@ class IPConfigurator:
 def parse_hardware_ports(ports_string):
     ports = {}
     port_name = None
-    for l in ports_string.decode("utf-8").split("\n"):
-        if l.startswith("Hardware Port:"):
-            port_name = l.strip()[15:]
-        elif l.startswith("Device:"):
-            ports[port_name] = l.strip()[8:]
+    for line in ports_string.decode("utf-8").split("\n"):
+        if line.startswith("Hardware Port:"):
+            port_name = line.strip()[15:]
+        elif line.startswith("Device:"):
+            ports[port_name] = line.strip()[8:]
             port_name = None
     return ports
 
@@ -284,6 +294,8 @@ def tb_connectivity_to_dot(hosts, tb_hosts, uuid_reverse_index):
         for p in h.ports:
             if not p.connected_to:
                 continue
+            if p.connected_to not in uuid_reverse_index:
+                continue
             dst = uuid_reverse_index[p.connected_to]
             if dst[0] < i:
                 continue
@@ -330,7 +342,8 @@ def check_valid_mesh(hosts, connectivity, strict=True):
             if connectivity[i][j] <= 0:
                 if strict:
                     log_error(
-                        f"Incomplete mesh, {hosts[i].ssh_hostname} is not connected to {hosts[j].ssh_hostname}"
+                        f"Incomplete mesh, {hosts[i].ssh_hostname} is not connected to "
+                        f"{hosts[j].ssh_hostname}"
                     )
                     log_error()
                     log_error("Try passing --dot to visualize the connectivity")
@@ -340,7 +353,21 @@ def check_valid_mesh(hosts, connectivity, strict=True):
     return True
 
 
-def check_ssh_connections(hosts):
+def check_valid_ring(hosts, rings, strict=True):
+    has_ring = len(rings) > 0 and len(rings[0][0]) == len(hosts)
+    if strict and not has_ring:
+        log_error("Could not find a full ring.")
+        log_error()
+        log_error("Try passing --dot to visualize the connectivity")
+        if len(rings) > 0:
+            log_error("Rings found:")
+            for r, _ in rings:
+                log_error(f" - {','.join(hosts[i].ssh_hostname for i in r)}")
+        sys.exit(1)
+    return has_ring
+
+
+def check_ssh_connections(hosts, ignore_unreachable=False):
     results = [None] * len(hosts)
 
     def _check(hostname, i):
@@ -392,7 +419,7 @@ def check_ssh_connections(hosts):
     for t in threads:
         t.join()
 
-    if not all(results):
+    if not all(results) and not ignore_unreachable:
         log_error("Could not ssh to the following hosts:")
         for i, h in enumerate(hosts):
             if not results[i]:
@@ -405,78 +432,93 @@ def check_ssh_connections(hosts):
 
 
 def prepare_ethernet_hostfile(args, hosts):
-    log(args.verbose, f"Preparing an ethernet hostfile")
+    log(args.verbose, "Preparing an ethernet hostfile")
     add_ips(hosts, args.verbose)
 
-    hostfile = []
-    for h in hosts:
-        hostfile.append(dict(ssh=h.ssh_hostname, ips=h.ips))
+    hostfile = Hostfile(
+        [Host(i, h.ssh_hostname, h.ips, []) for i, h in enumerate(hosts)], "", args.env
+    )
 
-    if args.output_hostfile:
-        with open(args.output_hostfile, "w") as f:
-            json.dump(hostfile, f, indent=4)
-    else:
-        print("Hostfile")
-        print("========")
-        print(json.dumps(hostfile, indent=4))
+    save_hostfile(args, hostfile)
 
 
 def configure_ring(args, hosts, ips, ring, sshinfo):
     log(args.verbose, "Prepare a ring hostfile")
     ring, count = ring
-    hostfile = []
+    ring_hosts = []
     for i, node in enumerate(ring):
         h = hosts[node]
         peer = ring[i - 1]
-        hostfile.append(
-            {
-                "ssh": h.ssh_hostname,
-                "ips": [ips.ips[node, peer][c][1] for c in range(count)],
-                "rdma": [],
-            }
+        ring_hosts.append(
+            Host(
+                i, h.ssh_hostname, [ips.ips[node, peer][c][1] for c in range(count)], []
+            )
         )
+    hostfile = Hostfile(ring_hosts, "ring", args.env)
 
     has_sudo = can_auto_setup(hosts, sshinfo, args.auto_setup)
     ips.setup(verbose=args.verbose, auto_setup=args.auto_setup and has_sudo)
 
-    if args.output_hostfile:
-        with open(args.output_hostfile, "w") as f:
-            json.dump(hostfile, f, indent=4)
-    else:
-        print("Hostfile")
-        print("========")
-        print(json.dumps(hostfile, indent=4))
+    save_hostfile(args, hostfile)
 
 
 def configure_jaccl(args, hosts, ips, sshinfo):
     log(args.verbose, "Prepare a jaccl hostfile")
-    check_rdma(hosts, args.verbose)
     add_ips(hosts, args.verbose)
 
-    hostfile = []
+    num_nodes = len(hosts)
+    count = min(
+        len(ips.ips[i, j]) for i in range(num_nodes) for j in range(num_nodes) if i != j
+    )
+    jaccl_hosts = []
     for i, h in enumerate(hosts):
         rdma = []
-        for j in range(len(hosts)):
+        for j in range(num_nodes):
             if i == j:
                 rdma.append(None)
             else:
-                rdma.append(f"rdma_{ips.ips[i, j][0][0]}")
-        hostfile.append({"ssh": h.ssh_hostname, "ips": h.ips, "rdma": rdma})
+                devices = [f"rdma_{ips.ips[i, j][c][0]}" for c in range(count)]
+                rdma.append(devices[0] if count == 1 else devices)
+        jaccl_hosts.append(Host(i, h.ssh_hostname, h.ips, rdma))
+    hostfile = Hostfile(jaccl_hosts, "jaccl", args.env)
 
     has_sudo = can_auto_setup(hosts, sshinfo, args.auto_setup)
     ips.setup(verbose=args.verbose, auto_setup=args.auto_setup and has_sudo)
 
-    if args.output_hostfile:
-        with open(args.output_hostfile, "w") as f:
-            json.dump(hostfile, f, indent=4)
-    else:
-        print("Hostfile")
-        print("========")
-        print(json.dumps(hostfile, indent=4))
+    save_hostfile(args, hostfile)
+
+
+def configure_jaccl_ring(args, hosts, ips, ring, sshinfo):
+    log(args.verbose, "Prepare a jaccl-ring hostfile")
+    add_ips(hosts, args.verbose)
+
+    jaccl_hosts = []
+    num_nodes = len(hosts)
+    ring, count = ring
+    for i, node in enumerate(ring):
+        h = hosts[node]
+        peer_left = ring[i - 1]
+        peer_right = ring[(i + 1) % num_nodes]
+        rdmas = []
+        for other in ring:
+            if other not in (peer_left, peer_right):
+                rdmas.append(None)
+            else:
+                rdma = []
+                for c in range(count):
+                    rdma.append(f"rdma_{ips.ips[node, other][c][0]}")
+                rdmas.append(rdma[0] if count == 1 else rdma)
+        jaccl_hosts.append(Host(i, h.ssh_hostname, h.ips, rdmas))
+    hostfile = Hostfile(jaccl_hosts, "jaccl-ring", args.env)
+
+    has_sudo = can_auto_setup(hosts, sshinfo, args.auto_setup)
+    ips.setup(verbose=args.verbose, auto_setup=args.auto_setup and has_sudo)
+
+    save_hostfile(args, hostfile)
 
 
 def prepare_tb_hostfile(args, hosts, sshinfo):
-    log(args.verbose, f"Preparing for communication over thunderbolt")
+    log(args.verbose, "Preparing for communication over thunderbolt")
     tb_hosts, uuid_reverse_index = extract_connectivity(hosts, args.verbose)
 
     if args.dot:
@@ -489,36 +531,43 @@ def prepare_tb_hostfile(args, hosts, sshinfo):
     if args.backend is None:
         rings = extract_rings(connectivity)
         has_mesh = check_valid_mesh(hosts, connectivity, False)
-        has_ring = len(rings) > 0 and len(rings[0][0]) == len(hosts)
+        has_ring = check_valid_ring(hosts, rings, False)
+        has_rdma = check_rdma(hosts, args.verbose, False)
 
         if not has_ring and not has_mesh:
             log_error("Neither thunderbolt mesh nor ring found.")
             log_error("Perhaps run with --dot to generate a plot of the connectivity.")
             sys.exit(1)
 
+        elif has_rdma and has_mesh:
+            configure_jaccl(args, hosts, ips, sshinfo)
+
+        elif has_rdma and has_ring:
+            configure_jaccl_ring(args, hosts, ips, rings[0], sshinfo)
+
         elif has_ring:
             configure_ring(args, hosts, ips, rings[0], sshinfo)
 
         else:
-            configure_jaccl(args, hosts, ips, sshinfo)
+            log_error("RDMA is not available and ring is not found.")
+            log_error("Perhaps run with --dot to generate a plot of the connectivity.")
+            sys.exit(1)
 
     elif args.backend == "ring":
         rings = extract_rings(connectivity)
-        has_ring = len(rings) > 0 and len(rings[0][0]) == len(hosts)
-        if not has_ring:
-            log_error("Could not find a full ring.")
-            log_error()
-            log_error("Try passing --dot to visualize the connectivity")
-            if len(rings) > 0:
-                log_error("Rings found:")
-                for r in rings:
-                    log_error(f" - {','.join(hosts[i].ssh_hostname for i in r)}")
-            sys.exit(1)
+        check_valid_ring(hosts, rings)
         configure_ring(args, hosts, ips, rings[0], sshinfo)
 
     elif args.backend == "jaccl":
         check_valid_mesh(hosts, connectivity)
+        check_rdma(hosts, args.verbose)
         configure_jaccl(args, hosts, ips, sshinfo)
+
+    elif args.backend == "jaccl-ring":
+        rings = extract_rings(connectivity)
+        check_valid_ring(hosts, rings)
+        check_rdma(hosts, args.verbose)
+        configure_jaccl_ring(args, hosts, ips, rings[0], sshinfo)
 
 
 def main():
@@ -531,13 +580,17 @@ def main():
     parser.add_argument(
         "--hosts", default="127.0.0.1", help="A comma separated list of hosts"
     )
+    parser.add_argument(
+        "--ignore-unreachable",
+        action="store_true",
+        help="Ignore hosts that are not reachable via ssh",
+    )
     parser.add_argument("--hostfile", help="The file containing the hosts")
     parser.add_argument(
         "--over",
         choices=["thunderbolt", "ethernet"],
         default="thunderbolt",
         help="What type of connectivity to configure",
-        required=True,
     )
     parser.add_argument(
         "--output-hostfile", help="If provided, save the hostfile to this path"
@@ -555,23 +608,34 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["ring", "jaccl"],
+        choices=["ring", "jaccl", "jaccl-ring"],
         default=None,
         help="Which distributed backend to configure",
     )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="Set environment variables for the jobs",
+    )
     args = parser.parse_args()
 
-    if args.hostfile is not None:
-        hosts = parse_hostfile(parser, args.hostfile)
-    else:
-        hosts = parse_hostlist(parser, args.hosts, 1)
+    try:
+        if args.hostfile is not None:
+            hosts = Hostfile.from_file(args.hostfile).hosts
+        else:
+            hosts = Hostfile.from_list(args.hosts).hosts
+    except ValueError as e:
+        parser.error(str(e))
 
     # Check that we can ssh
     log(
         args.verbose,
         f"Checking for ssh access for {', '.join(h.ssh_hostname for h in hosts)}",
     )
-    sshinfo = check_ssh_connections(hosts)
+    sshinfo = check_ssh_connections(hosts, args.ignore_unreachable)
+    hosts = [h for r, h in zip(sshinfo, hosts) if r]
+    sshinfo = [r for r in sshinfo if r]
 
     # Prepare a hostfile for communication over ethernet using the ips of the
     # provided hostnames

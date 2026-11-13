@@ -5,6 +5,7 @@
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/cuda/reduce/reduce_ops.cuh"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/gpu/scan.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
@@ -205,7 +206,8 @@ __global__ void strided_scan(
     U* out,
     int32_t axis_size,
     int64_t stride,
-    int64_t stride_blocks) {
+    int64_t stride_blocks,
+    int64_t data_size) {
   auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
@@ -232,7 +234,10 @@ __global__ void strided_scan(
   uint32_t scan_offset_y = warp.thread_rank();
   uint32_t scan_offset_x = warp.meta_group_rank() * n_scans;
 
-  uint32_t stride_limit = stride - global_index_x;
+  int64_t stride_limit = cuda::std::min(
+      stride - global_index_x,
+      data_size - offset - global_index_x);
+
   in += offset + global_index_x + read_offset_x;
   out += offset + global_index_x + read_offset_x;
   U* read_into = read_buffer + read_offset_y * BN_pad + read_offset_x;
@@ -362,51 +367,38 @@ constexpr bool supports_scan_op() {
   }
 }
 
-void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Scan::eval_gpu");
-  assert(inputs.size() == 1);
-  auto in = inputs[0];
-  auto& s = stream();
+void scan_gpu_inplace(
+    const array& in,
+    array& out,
+    Scan::ReduceType reduce_type,
+    int axis,
+    bool reverse,
+    bool inclusive,
+    const Stream& s) {
   auto& encoder = cu::get_command_encoder(s);
-
-  if (in.flags().contiguous && in.strides()[axis_] != 0) {
-    if (in.is_donatable() && in.itemsize() == out.itemsize()) {
-      out.copy_shared_buffer(in);
-    } else {
-      out.set_data(
-          cu::malloc_async(in.data_size() * out.itemsize(), encoder),
-          in.data_size(),
-          in.strides(),
-          in.flags());
-    }
-  } else {
-    in = contiguous_copy_gpu(in, s);
-    out.copy_shared_buffer(in);
-  }
-
   constexpr int N_READS = 4;
-  int32_t axis_size = in.shape(axis_);
-  bool contiguous = in.strides()[axis_] == 1;
+  int32_t axis_size = in.shape(axis);
+  bool contiguous = in.strides()[axis] == 1;
 
   encoder.set_input_array(in);
   encoder.set_output_array(out);
 
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
-    dispatch_scan_ops(reduce_type_, [&](auto scan_op_tag) {
+    dispatch_scan_ops(reduce_type, [&](auto scan_op_tag) {
       using Op = MLX_GET_TYPE(scan_op_tag);
       if constexpr (supports_scan_op<Op, T>()) {
         using U = typename cu::ScanResult<Op, T>::type;
-        dispatch_bool(inclusive_, [&](auto inclusive) {
-          dispatch_bool(reverse_, [&](auto reverse) {
+        dispatch_bool(inclusive, [&](auto inclusive_tag) {
+          dispatch_bool(reverse, [&](auto reverse_tag) {
             if (contiguous) {
               auto kernel = cu::contiguous_scan<
                   T,
                   U,
                   Op,
                   N_READS,
-                  inclusive.value,
-                  reverse.value>;
+                  inclusive_tag.value,
+                  reverse_tag.value>;
               int block_dim = cuda::ceil_div(axis_size, N_READS);
               block_dim = cuda::ceil_div(block_dim, WARP_SIZE) * WARP_SIZE;
               block_dim = std::min(block_dim, WARP_SIZE * WARP_SIZE);
@@ -414,7 +406,6 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
                   kernel,
                   in.data_size() / axis_size,
                   block_dim,
-                  0,
                   gpu_ptr<T>(in),
                   gpu_ptr<U>(out),
                   axis_size);
@@ -428,9 +419,9 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
                   N_READS,
                   BM,
                   BN,
-                  inclusive.value,
-                  reverse.value>;
-              int64_t stride = in.strides()[axis_];
+                  inclusive_tag.value,
+                  reverse_tag.value>;
+              int64_t stride = in.strides()[axis];
               int64_t stride_blocks = cuda::ceil_div(stride, BN);
               dim3 num_blocks = get_2d_grid_dims(
                   in.shape(), in.strides(), axis_size * stride);
@@ -444,24 +435,56 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
                   kernel,
                   num_blocks,
                   block_dim,
-                  0,
                   gpu_ptr<T>(in),
                   gpu_ptr<U>(out),
                   axis_size,
                   stride,
-                  stride_blocks);
+                  stride_blocks,
+                  int64_t(in.data_size()));
             }
           });
         });
       } else {
-        throw std::runtime_error(fmt::format(
-            "Can not do scan op {} on inputs of {} with result of {}.",
-            op_to_string<Op>(),
-            dtype_to_string(in.dtype()),
-            dtype_to_string(out.dtype())));
+        throw std::runtime_error(
+            fmt::format(
+                "Can not do scan op {} on inputs of {} with result of {}.",
+                op_to_string<Op>(),
+                dtype_to_string(in.dtype()),
+                dtype_to_string(out.dtype())));
       }
     });
   });
+}
+
+void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("Scan::eval_gpu");
+  assert(inputs.size() == 1);
+  auto in = inputs[0];
+  auto& s = stream();
+  auto& encoder = cu::get_command_encoder(s);
+
+  if (out.size() == 0) {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    return;
+  }
+
+  if (in.flags().contiguous && in.strides()[axis_] != 0) {
+    if (in.is_donatable() && in.itemsize() == out.itemsize()) {
+      out.copy_shared_buffer(in);
+    } else {
+      out.set_data(
+          cu::malloc_async(in.data_size() * out.itemsize(), encoder),
+          in.data_size(),
+          in.strides(),
+          in.flags());
+    }
+  } else {
+    // Output type can be wider than input
+    copy_gpu(in, out, CopyType::General, s);
+    in = out;
+  }
+
+  scan_gpu_inplace(in, out, reduce_type_, axis_, reverse_, inclusive_, s);
 }
 
 } // namespace mlx::core

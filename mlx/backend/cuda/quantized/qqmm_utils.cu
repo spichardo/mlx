@@ -8,13 +8,6 @@
 
 namespace mlx::core {
 
-namespace cg = cooperative_groups;
-
-constexpr int TILE_ROWS = 128;
-constexpr int TILE_COLS = 4;
-constexpr int TILES_PER_LANE = 1;
-constexpr int LANES_PER_BLOCK = 32;
-
 // To pass scales to tensor cores, they need to be repacked into a tiled layout
 // https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
 // Tiled layout for scale factors is very well described in CUTLASS
@@ -48,6 +41,14 @@ constexpr int LANES_PER_BLOCK = 32;
 //          [252, 253, 254, 255],
 //          [380, 381, 382, 383],
 //          [508, 509, 510, 511]]]]],
+namespace cu {
+
+constexpr int TILE_ROWS = 128;
+constexpr int TILE_COLS = 4;
+constexpr int TILES_PER_LANE = 1;
+constexpr int LANES_PER_BLOCK = 32;
+
+namespace cg = cooperative_groups;
 
 inline std::tuple<dim3, dim3> get_swizzle_launch_args(
     size_t M_swizzled,
@@ -68,7 +69,17 @@ inline std::tuple<dim3, dim3> get_swizzle_launch_args(
   return std::make_tuple(grid, block);
 }
 
-namespace cu {
+__global__ void compute_qqmm_pointers(
+    float* alpha_out,
+    float* beta_out,
+    const float* tensor_amax_x,
+    const float* tensor_amax_w) {
+  // Compute alpha = tensor_amax_x * tensor_amax_w / (448 * 6)^2
+  constexpr float inv_scale_sq =
+      1.0f / (F8E4M3_MAX * F4E2M1_MAX * F8E4M3_MAX * F4E2M1_MAX);
+  *alpha_out = (*tensor_amax_x) * (*tensor_amax_w) * inv_scale_sq;
+  *beta_out = 0.0f;
+}
 
 __global__ void swizzle_scales(
     const uint8_t* scales_linear,
@@ -210,18 +221,37 @@ void swizzle_scales(
   size_t output_cols = scales_tiled.shape(-1);
 
   auto [num_blocks, block_dims] =
-      get_swizzle_launch_args(output_rows, output_cols);
+      cu::get_swizzle_launch_args(output_rows, output_cols);
   enc.add_kernel_node(
       cu::swizzle_scales,
       num_blocks,
       block_dims,
-      0,
       gpu_ptr<uint8_t>(scales),
       gpu_ptr<uint8_t>(scales_tiled),
       input_rows,
       input_cols,
       output_rows,
       output_cols);
+}
+
+void compute_qqmm_pointers(
+    array& alpha_out,
+    array& beta_out,
+    const array& tensor_amax_x,
+    const array& tensor_amax_w,
+    cu::CommandEncoder& enc) {
+  enc.set_input_array(tensor_amax_x);
+  enc.set_input_array(tensor_amax_w);
+  enc.set_output_array(alpha_out);
+  enc.set_output_array(beta_out);
+  enc.add_kernel_node(
+      cu::compute_qqmm_pointers,
+      dim3(1),
+      dim3(1),
+      gpu_ptr<void>(alpha_out),
+      gpu_ptr<void>(beta_out),
+      gpu_ptr<void>(tensor_amax_x),
+      gpu_ptr<void>(tensor_amax_w));
 }
 
 } // namespace mlx::core

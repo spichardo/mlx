@@ -6,6 +6,7 @@
 #include "mlx/stream.h"
 
 #include <optional>
+#include <vector>
 
 namespace mlx::core {
 
@@ -47,11 +48,16 @@ void fill_gpu(const array& val, array& out, const Stream& s);
 array contiguous_copy_gpu(const array& arr, const Stream& s);
 
 // Copy data from |in| and transpose to |out|'s shape.
-void reshape_gpu(const array& in, array& out, Stream s);
+void reshape_gpu(
+    const array& in,
+    array& out,
+    bool add_out_to_temporary_on_allocation,
+    Stream s);
 
 // Like the normal ops but safe to call in eval_gpu.
 array flatten_in_eval(const array& x, int start_axis, int end_axis, Stream s);
 array reshape_in_eval(const array& x, Shape shape, Stream s);
+array transpose_in_eval(const array& x, const std::vector<int>& axes);
 array swapaxes_in_eval(const array& x, int axis1, int axis2);
 
 } // namespace mlx::core

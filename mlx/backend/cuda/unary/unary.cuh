@@ -48,7 +48,9 @@ __global__ void unary_g(
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      (grid.block_index().z * grid.dim_blocks().y + grid.block_index().y) *
+          block.dim_threads().y +
+      block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -157,7 +159,6 @@ void unary_op_gpu_inplace(
                 cu::unary_v<Op, InType, OutType, IdxT, N_READS>,
                 num_blocks,
                 block_dims,
-                0,
                 gpu_ptr<InType>(in),
                 gpu_ptr<OutType>(out),
                 out.data_size());
@@ -173,15 +174,12 @@ void unary_op_gpu_inplace(
               kernel = cu::unary_g<Op, InType, OutType, IdxT, 4>;
               work_per_thread = 4;
             }
-            dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
-            auto block_dims = get_block_dims(dim0, rest, 1);
-            uint32_t num_blocks_x = cuda::ceil_div(dim0, block_dims.x);
-            uint32_t num_blocks_y = cuda::ceil_div(rest, block_dims.y);
+            auto [grid_dims, block_dims] =
+                get_launch_args_general(dim0, rest, work_per_thread);
             encoder.add_kernel_node(
                 kernel,
-                {num_blocks_x, num_blocks_y},
+                grid_dims,
                 block_dims,
-                0,
                 gpu_ptr<InType>(in),
                 gpu_ptr<OutType>(out),
                 rest,
@@ -191,11 +189,12 @@ void unary_op_gpu_inplace(
           }
         });
       } else {
-        throw std::runtime_error(fmt::format(
-            "Can not do unary op {} on input of {} with output of {}.",
-            op,
-            dtype_to_string(in.dtype()),
-            dtype_to_string(out.dtype())));
+        throw std::runtime_error(
+            fmt::format(
+                "Can not do unary op {} on input of {} with output of {}.",
+                op,
+                dtype_to_string(in.dtype()),
+                dtype_to_string(out.dtype())));
       }
     });
   });

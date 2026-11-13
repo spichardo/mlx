@@ -5,20 +5,15 @@
 #include "mlx/dtype_utils.h"
 
 #include <fmt/format.h>
+#include <cuda/cmath>
 #include <vector>
 
 namespace mlx::core {
 
-void check_cublas_error(const char* name, cublasStatus_t err) {
-  if (err != CUBLAS_STATUS_SUCCESS) {
-    // TODO: Use cublasGetStatusString when it is widely available.
-    throw std::runtime_error(
-        fmt::format("{} failed with code: {}.", name, static_cast<int>(err)));
-  }
-}
-
 void check_cuda_error(const char* name, cudaError_t err) {
   if (err != cudaSuccess) {
+    // Clear the error so it does not resurface in later checks.
+    cudaGetLastError();
     throw std::runtime_error(
         fmt::format("{} failed: {}", name, cudaGetErrorString(err)));
   }
@@ -29,13 +24,6 @@ void check_cuda_error(const char* name, CUresult err) {
     const char* err_str = "Unknown error";
     cuGetErrorString(err, &err_str);
     throw std::runtime_error(fmt::format("{} failed: {}", name, err_str));
-  }
-}
-
-void check_cudnn_error(const char* name, cudnnStatus_t err) {
-  if (err != CUDNN_STATUS_SUCCESS) {
-    throw std::runtime_error(
-        fmt::format("{} failed: {}.", name, cudnnGetErrorString(err)));
   }
 }
 

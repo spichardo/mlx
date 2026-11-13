@@ -1,13 +1,17 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <memory>
 
-#include <sys/sysctl.h>
-
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 
 namespace mlx::core::metal {
+
+namespace {
+
+std::string g_metallib_path;
+
+} // namespace
 
 bool is_available() {
   return true;
@@ -16,7 +20,7 @@ bool is_available() {
 void start_capture(std::string path, NS::Object* object) {
   auto pool = new_scoped_memory_pool();
 
-  auto descriptor = MTL::CaptureDescriptor::alloc()->init();
+  auto descriptor = MTL::CaptureDescriptor::alloc()->init()->autorelease();
   descriptor->setCaptureObject(object);
 
   if (!path.empty()) {
@@ -29,7 +33,6 @@ void start_capture(std::string path, NS::Object* object) {
   auto manager = MTL::CaptureManager::sharedCaptureManager();
   NS::Error* error;
   bool started = manager->startCapture(descriptor, &error);
-  descriptor->release();
   if (!started) {
     std::ostringstream msg;
     msg << "[metal::start_capture] Failed to start: "
@@ -49,36 +52,12 @@ void stop_capture() {
   manager->stopCapture();
 }
 
-const std::unordered_map<std::string, std::variant<std::string, size_t>>&
-device_info() {
-  auto init_device_info = []()
-      -> std::unordered_map<std::string, std::variant<std::string, size_t>> {
-    auto pool = new_scoped_memory_pool();
-    auto raw_device = device(default_device()).mtl_device();
-    auto name = std::string(raw_device->name()->utf8String());
-    auto arch = std::string(raw_device->architecture()->name()->utf8String());
+void set_metallib_path(const std::string& path) {
+  g_metallib_path = path;
+}
 
-    size_t memsize = 0;
-    size_t length = sizeof(memsize);
-    sysctlbyname("hw.memsize", &memsize, &length, NULL, 0);
-
-    size_t rsrc_limit = 0;
-    sysctlbyname("iogpu.rsrc_limit", &rsrc_limit, &length, NULL, 0);
-    if (rsrc_limit == 0) {
-      rsrc_limit = 499000;
-    }
-
-    return {
-        {"device_name", name},
-        {"architecture", arch},
-        {"max_buffer_length", raw_device->maxBufferLength()},
-        {"max_recommended_working_set_size",
-         raw_device->recommendedMaxWorkingSetSize()},
-        {"memory_size", memsize},
-        {"resource_limit", rsrc_limit}};
-  };
-  static auto device_info_ = init_device_info();
-  return device_info_;
+const std::string& get_metallib_path() {
+  return g_metallib_path;
 }
 
 } // namespace mlx::core::metal

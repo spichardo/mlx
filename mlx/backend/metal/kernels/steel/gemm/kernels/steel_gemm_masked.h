@@ -11,7 +11,7 @@ using namespace mlx::steel;
 struct _NoMask {
   char x;
 
-  constexpr METAL_FUNC operator bool() {
+  constexpr METAL_FUNC operator bool() thread {
     return true;
   }
   constexpr METAL_FUNC operator bool() const threadgroup {
@@ -29,7 +29,7 @@ template <typename OutT, typename InT = OutT>
 struct ScaleOp {
   OutT scale;
 
-  METAL_FUNC OutT apply(InT x) const {
+  METAL_FUNC OutT apply(InT x) const thread {
     return static_cast<OutT>(x) * scale;
   }
 };
@@ -49,7 +49,7 @@ template <
     bool transpose_b,
     bool MN_aligned,
     bool K_aligned>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 block_masked_gemm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
@@ -435,7 +435,7 @@ template <
     bool MN_aligned,
     bool K_aligned,
     bool has_operand_mask = false>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 block_masked_gemm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],

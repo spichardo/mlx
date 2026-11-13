@@ -1,8 +1,9 @@
-// Copyright © 2024 Apple Inc.
+// Copyright © 2024-2026 Apple Inc.
 
 #include <optional>
 #include <variant>
 
+#include "mlx/backend/common/custom_kernel.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core::fast {
@@ -94,6 +95,67 @@ class RMSNormVJP : public Custom {
 
  private:
   float eps_;
+};
+
+// loss is always fp32 and the logits never have to be upcast in the graph.
+class CrossEntropy : public Custom {
+ public:
+  CrossEntropy(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  DEFINE_NAME(CrossEntropy)
+  bool is_equivalent(const Primitive& other) const override {
+    return true;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {inputs[1].shape()};
+  }
+
+  auto state() const {
+    return std::monostate{};
+  }
+};
+
+class CrossEntropyVJP : public Custom {
+ public:
+  CrossEntropyVJP(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(CrossEntropyVJP)
+  bool is_equivalent(const Primitive& other) const override {
+    return true;
+  }
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::monostate{};
+  }
 };
 
 class LayerNorm : public Custom {
@@ -211,12 +273,16 @@ class ScaledDotProductAttention : public Custom {
       float scale,
       bool do_causal,
       bool has_sinks,
-      bool output_logsumexp)
+      int window_size,
+      bool output_logsumexp,
+      bool force_fused)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
-        output_logsumexp_(output_logsumexp) {}
+        window_size_(window_size),
+        output_logsumexp_(output_logsumexp),
+        force_fused_(force_fused) {}
 
   static bool use_fallback(
       const array& q,
@@ -225,8 +291,11 @@ class ScaledDotProductAttention : public Custom {
       bool has_mask,
       bool has_arr_mask,
       bool do_causal,
+      bool has_sinks,
+      int window_size,
       bool is_training,
       bool output_logsumexp,
+      bool force_fused,
       Stream s);
   static bool supports_bool_mask();
 
@@ -250,14 +319,22 @@ class ScaledDotProductAttention : public Custom {
   DEFINE_INPUT_OUTPUT_SHAPE()
   auto state() const {
     return std::make_tuple(
-        nullptr, scale_, do_causal_, has_sinks_, output_logsumexp_);
+        nullptr,
+        scale_,
+        do_causal_,
+        has_sinks_,
+        window_size_,
+        output_logsumexp_,
+        force_fused_);
   }
 
  private:
   float scale_;
   bool do_causal_;
   bool has_sinks_;
+  int window_size_;
   bool output_logsumexp_;
+  bool force_fused_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {
@@ -324,6 +401,67 @@ class ConvertFP8 : public Primitive {
   bool to_fp8_;
 };
 
+class GatedDeltaUpdate : public Custom {
+ public:
+  GatedDeltaUpdate(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  static bool
+  use_fallback(int Hk, int Dk, int Hv, int Dv, bool has_mask, Stream s);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  DEFINE_NAME(GatedDeltaUpdate);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr); /* TODO */
+  }
+
+ private:
+  bool is_training_;
+};
+
+class GatedDeltaUpdateVJP : public Custom {
+ public:
+  GatedDeltaUpdateVJP(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  static bool use_fallback(int Hk, int Dk, int Hv, int Dv, Stream s);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(GatedDeltaUpdateVJP);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr); /* TODO */
+  }
+
+ private:
+  bool has_cache_;
+};
+
 class Quantize : public Custom {
  public:
   explicit Quantize(
@@ -368,6 +506,7 @@ class CustomKernel : public Primitive {
       Stream stream,
       std::string name,
       std::string source,
+      size_t source_hash,
       std::tuple<int, int, int> grid,
       std::tuple<int, int, int> threadgroup,
       std::vector<std::tuple<bool, bool, bool>> shape_infos,
@@ -376,10 +515,12 @@ class CustomKernel : public Primitive {
       std::vector<ScalarArg> scalar_arguments,
       bool is_precompiled,
       int shared_memory,
-      bool use_optimal_threadgroups)
+      CompileOptions::Data compile_options = {},
+      bool use_optimal_threadgroups = false)
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
+        source_hash_(source_hash),
         grid_(grid),
         threadgroup_(threadgroup),
         shape_infos_(std::move(shape_infos)),
@@ -388,6 +529,7 @@ class CustomKernel : public Primitive {
         scalar_arguments_(std::move(scalar_arguments)),
         is_precompiled_(is_precompiled),
         shared_memory_(shared_memory),
+        compile_options_(compile_options),
         use_optimal_threadgroups_(use_optimal_threadgroups) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
@@ -403,6 +545,7 @@ class CustomKernel : public Primitive {
     return std::make_tuple(
         name_,
         source_,
+        source_hash_,
         grid_,
         threadgroup_,
         shape_infos_,
@@ -411,12 +554,14 @@ class CustomKernel : public Primitive {
         scalar_arguments_,
         is_precompiled_,
         shared_memory_,
+        compile_options_,
         use_optimal_threadgroups_);
   }
 
  private:
   std::string name_;
   std::string source_;
+  size_t source_hash_;
   std::tuple<int, int, int> grid_;
   std::tuple<int, int, int> threadgroup_;
   std::vector<std::tuple<bool, bool, bool>> shape_infos_;
@@ -425,6 +570,7 @@ class CustomKernel : public Primitive {
   std::vector<ScalarArg> scalar_arguments_;
   bool is_precompiled_;
   int shared_memory_;
+  CompileOptions::Data compile_options_;
   bool use_optimal_threadgroups_;
 };
 

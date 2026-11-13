@@ -21,32 +21,7 @@ constexpr const char* default_header = R"(
 
 #include <cooperative_groups.h>
 
-#define inf cuda::std::numeric_limits<float>::infinity()
-
 )";
-
-std::string template_arguments_hash(
-    const std::vector<std::pair<std::string, TemplateArg>>& template_args) {
-  if (template_args.empty()) {
-    return "";
-  }
-
-  std::string hash;
-  hash.reserve(512);
-
-  for (const auto& [name, arg] : template_args) {
-    if (std::holds_alternative<int>(arg)) {
-      hash += fmt::format("_{}", std::get<int>(arg));
-    } else if (std::holds_alternative<bool>(arg)) {
-      hash += (std::get<bool>(arg)) ? "_t" : "_f";
-    } else if (std::holds_alternative<Dtype>(arg)) {
-      hash += "_";
-      hash += get_type_string(std::get<Dtype>(arg));
-    }
-  }
-
-  return hash;
-}
 
 std::string build_kernel(
     const std::string& func_name,
@@ -76,9 +51,7 @@ std::string build_kernel(
     const auto& name = input_names[i];
     const auto& arr = inputs[i];
     const auto& rw = input_rw_status[i];
-    if (!rw) { //if read-only (default), otherwise read-write
-       kernel_source += "  const ";
-    }
+    kernel_source += rw ? "    " : "    const ";
     kernel_source += dtype_to_cuda_type(arr.dtype());
     kernel_source += "* ";
     kernel_source += name;
@@ -168,7 +141,9 @@ CustomKernelFunction cuda_kernel(
     shape_infos.push_back(shape_info);
   }
 
-  return [=, shape_infos = std::move(shape_infos)](
+  return [=,
+          cache = std::make_shared<GeneratedSourceCache>(),
+          shape_infos = std::move(shape_infos)](
              const std::vector<array>& inputs,
              const std::vector<Shape>& output_shapes,
              const std::vector<Dtype>& output_dtypes,
@@ -178,14 +153,8 @@ CustomKernelFunction cuda_kernel(
                  template_args = {},
              std::optional<float> init_value = std::nullopt,
              bool verbose = false,
+             bool use_optimal_threadgroups = false,
              StreamOrDevice s_ = {}) {
-    if (inputs.size() != input_names.size()) {
-      std::ostringstream msg;
-      msg << "[custom_kernel] Expected `inputs` to have size "
-          << input_names.size() << " but got size " << inputs.size() << "."
-          << std::endl;
-      throw std::invalid_argument(msg.str());
-    }
     if (inputs.size() != input_names.size()) {
       std::ostringstream msg;
       msg << "[custom_kernel] Expected `inputs` to have size "
@@ -195,7 +164,7 @@ CustomKernelFunction cuda_kernel(
     }
     if (inputs.size() != input_rw_status.size()) {
       std::ostringstream msg;
-      msg << "[metal_kernel] Expected `input_rw_status` to have size "
+      msg << "[custom_kernel] Expected `input_rw_status` to have size "
           << input_names.size() << " but got size " << input_rw_status.size() << "."
           << std::endl;
       throw std::invalid_argument(msg.str());
@@ -222,17 +191,20 @@ CustomKernelFunction cuda_kernel(
 
     std::string kernel_name =
         "custom_kernel_" + name + template_arguments_hash(template_args);
-    std::string kernel_source = build_kernel(
-        kernel_name,
-        header,
-        source,
-        input_names,
-        input_rw_status,
-        inputs,
-        output_names,
-        output_dtypes,
-        template_args,
-        shape_infos);
+
+    const auto& [kernel_source, source_hash] = cache->get(kernel_name, [&] {
+      return build_kernel(
+          kernel_name,
+          header,
+          source,
+          input_names,
+          input_rw_status,
+          inputs,
+          output_names,
+          output_dtypes,
+          template_args,
+          shape_infos);
+    });
 
     if (verbose) {
       std::cout << "Generated source code for `" << kernel_name
@@ -248,7 +220,8 @@ CustomKernelFunction cuda_kernel(
         std::make_shared<CustomKernel>(
             s,
             std::move(kernel_name),
-            std::move(kernel_source),
+            kernel_source,
+            source_hash,
             grid,
             threadgroup,
             shape_infos,
@@ -257,6 +230,7 @@ CustomKernelFunction cuda_kernel(
             std::vector<ScalarArg>{},
             false,
             shared_memory,
+            /* compile_options = */ {},
             use_optimal_threadgroups),
         std::move(inputs));
   };
@@ -284,6 +258,7 @@ std::vector<array> precompiled_cuda_kernel(
           to_stream(s),
           name,
           compiled_source,
+          std::hash<std::string>{}(compiled_source),
           grid,
           threadgroup,
           shape_infos,
@@ -291,8 +266,7 @@ std::vector<array> precompiled_cuda_kernel(
           init_value,
           scalars,
           true,
-          shared_memory,
-          use_optimal_threadgroups),
+          shared_memory),
       inputs);
 }
 
@@ -334,9 +308,10 @@ void CustomKernel::eval_gpu(
   // Compile the custom kernel
   std::string kernel_name =
       (is_precompiled_) ? name_ : "mlx::core::cu::" + name_;
+  std::string module_name = fmt::format("{}_{:x}", name_, source_hash_);
   cu::JitModule& mod = cu::get_jit_module(
-      s.device,
-      name_,
+      encoder.device(),
+      module_name,
       [&]() {
         return std::make_tuple(
             is_precompiled_, source_, std::vector{kernel_name});
@@ -395,7 +370,8 @@ void CustomKernel::eval_gpu(
               kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem);
         }
       });
-  encoder.add_kernel_node(kernel, grid, block, shared_memory_, args.args());
+  encoder.add_kernel_node_raw(
+      kernel, grid, block, {}, shared_memory_, args.args());
 }
 
 } // namespace mlx::core::fast

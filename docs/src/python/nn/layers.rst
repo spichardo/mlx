@@ -10,10 +10,12 @@ Layers
    :template: nn-module-template.rst
 
    ALiBi
+   AllToShardedLinear
    AvgPool1d
    AvgPool2d
    AvgPool3d
    BatchNorm
+   Bilinear
    CELU
    Conv1d
    Conv2d
@@ -33,6 +35,7 @@ Layers
    HardShrink
    HardTanh
    Hardswish
+   Identity
    InstanceNorm
    LayerNorm
    LeakyReLU
@@ -46,8 +49,11 @@ Layers
    Mish
    MultiHeadAttention
    PReLU
+   QQLinear
+   QuantizedAllToShardedLinear
    QuantizedEmbedding
    QuantizedLinear
+   QuantizedShardedToAllLinear
    RMSNorm
    ReLU
    ReLU2
@@ -56,6 +62,7 @@ Layers
    RoPE
    SELU
    Sequential
+   ShardedToAllLinear
    Sigmoid
    SiLU
    SinusoidalPositionalEncoding
@@ -67,4 +74,8 @@ Layers
    Step
    Tanh
    Transformer
+   TransformerDecoder
+   TransformerDecoderLayer
+   TransformerEncoder
+   TransformerEncoderLayer
    Upsample

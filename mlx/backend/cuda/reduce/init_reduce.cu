@@ -31,6 +31,10 @@ void init_reduce(
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
   }
 
+  if (out.size() == 0) {
+    return;
+  }
+
   encoder.set_output_array(out);
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
@@ -41,8 +45,7 @@ void init_reduce(
       dim3 grid = get_2d_grid_dims(out.shape(), out.strides());
       dim3 block(grid.x < 1024 ? grid.x : 1024, 1, 1);
       grid.x = (grid.x + 1023) / 1024;
-      encoder.add_kernel_node(
-          kernel, grid, block, 0, gpu_ptr<U>(out), out.size());
+      encoder.add_kernel_node(kernel, grid, block, gpu_ptr<U>(out), out.size());
     });
   });
 }

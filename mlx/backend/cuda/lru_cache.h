@@ -33,8 +33,8 @@ class LRUCache {
 
   // Initialize with capacity read from |env_name|.
   LRUCache(const char* env_name, int default_capacity)
-      : LRUCache(env::get_var(env_name, default_capacity)) {
-    if (env::get_var("MLX_ENABLE_CACHE_THRASHING_CHECK", 1)) {
+      : LRUCache(config::get(env_name, default_capacity)) {
+    if (config::get("MLX_ENABLE_CACHE_THRASHING_CHECK", 1)) {
       env_name_ = env_name;
     }
   }
@@ -76,6 +76,7 @@ class LRUCache {
     auto it = map_.find(key);
     if (it == map_.end())
       return end();
+    cache_misses_ = 0;
     vlist_.splice(vlist_.begin(), vlist_, it->second);
     return it->second;
   }
@@ -84,16 +85,18 @@ class LRUCache {
   std::pair<iterator, bool> emplace(const K& key, U&& value) {
     auto it = map_.find(key);
     if (it != map_.end()) {
+      cache_misses_ = 0;
       vlist_.splice(vlist_.begin(), vlist_, it->second);
       return {it->second, false};
     }
 
     if (env_name_ && ++cache_misses_ > 2 * capacity_) {
-      throw std::runtime_error(fmt::format(
-          "Cache thrashing is happening, please set the environment variable "
-          "{} to a larger value than {} to fix degraded performance.",
-          env_name_,
-          capacity_));
+      throw std::runtime_error(
+          fmt::format(
+              "Cache thrashing is happening, please set the environment variable "
+              "{} to a larger value than {} to fix degraded performance.",
+              env_name_,
+              capacity_));
     }
 
     vlist_.emplace_front(key, std::forward<U>(value));
@@ -136,9 +139,15 @@ class LRUCache {
 
 // Turn a POD struct into a container key by doing bytes compare.
 //
+// IMPORTANT: Do not use aggregate init on the pod field (key.pod = {...}).
+// It creates a stack temporary whose padding bytes are uninitialized, and
+// trivial copy-assignment copies the entire struct including padding —
+// breaking the memcmp-based comparison. Set fields individually instead.
+//
 // Usage:
 //   BytesKey<MyKey> key;
-//   key.pod = { ... };
+//   key.pod.field1 = value1;
+//   key.pod.field2 = value2;
 template <typename T>
 struct BytesKey {
   T pod;

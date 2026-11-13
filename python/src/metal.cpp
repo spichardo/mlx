@@ -1,6 +1,4 @@
 // Copyright © 2023-2024 Apple Inc.
-#include <iostream>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -8,7 +6,10 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <iostream>
+
 #include "mlx/backend/metal/metal.h"
+#include "mlx/device.h"
 #include "mlx/memory.h"
 #include "python/src/small_vector.h"
 
@@ -90,21 +91,8 @@ void init_metal(nb::module_& m) {
       R"pbdoc(
       Stop a Metal capture.
       )pbdoc");
-  metal.def(
-      "device_info",
-      &mx::metal::device_info,
-      R"pbdoc(
-      Get information about the GPU device and system settings.
-
-      Currently returns:
-
-      * ``architecture``
-      * ``max_buffer_size``
-      * ``max_recommended_working_set_size``
-      * ``memory_size``
-      * ``resource_limit``
-
-      Returns:
-          dict: A dictionary with string keys and string or integer values.
-      )pbdoc");
+  metal.def("device_info", []() {
+    DEPRECATE("mx.metal.device_info", "mx.device_info");
+    return mx::device_info(mx::Device(mx::Device::gpu, 0));
+  });
 }

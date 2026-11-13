@@ -15,20 +15,18 @@ namespace {
 cublasComputeType_t dtype_to_compute_type(Dtype dtype) {
   switch (dtype) {
     case float16:
-      return CUBLAS_COMPUTE_32F;
     case bfloat16:
       return CUBLAS_COMPUTE_32F;
     case float32:
+    case complex64:
       return mlx::core::env::enable_tf32() ? CUBLAS_COMPUTE_32F_FAST_TF32
                                            : CUBLAS_COMPUTE_32F;
     case float64:
       return CUBLAS_COMPUTE_64F;
-    case complex64:
-      return mlx::core::env::enable_tf32() ? CUBLAS_COMPUTE_32F_FAST_TF32
-                                           : CUBLAS_COMPUTE_32F;
     default:
-      throw std::runtime_error(fmt::format(
-          "Unsupported dtype in CublasGemm: {}.", dtype_to_string(dtype)));
+      throw std::runtime_error(
+          fmt::format(
+              "Unsupported dtype in CublasGemm: {}.", dtype_to_string(dtype)));
   }
 }
 
@@ -72,6 +70,14 @@ CublasGemm::CublasGemm(
       batch_count,
       a_batch_stride,
       b_batch_stride);
+
+  // alpha and beta are both host pointers
+  cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(
+      matmul_desc_,
+      CUBLASLT_MATMUL_DESC_POINTER_MODE,
+      &pointer_mode,
+      sizeof(pointer_mode)));
 }
 
 CublasGemm::CublasGemm(
@@ -214,8 +220,8 @@ void CublasGemm::execute(
     const void* a,
     const void* b,
     const void* c,
-    float alpha /* = 1 */,
-    float beta /* = 0 */) {
+    const float alpha /* = 1 */,
+    const float beta /* = 0 */) {
   const void* alpha_ptr = &alpha;
   const void* beta_ptr = &beta;
   complex64_t alpha_c, beta_c;

@@ -5,19 +5,20 @@
 #include "mlx/array.h"
 #include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/lru_cache.h"
-#include "mlx/backend/cuda/worker.h"
+#include "mlx/backend/cuda/utils.h"
 #include "mlx/stream.h"
 
-#include <cublasLt.h>
-#include <cuda.h>
-#include <cudnn.h>
-#include <thrust/execution_policy.h>
-
+#include <memory>
 #include <unordered_map>
 
 namespace mlx::core::cu {
 
-class CommandEncoder {
+// Compute a key and updatability flag for a CUDA graph by walking its nodes.
+std::pair<std::string, bool> subgraph_to_key(cudaGraph_t graph);
+
+class Worker;
+
+class MLX_API CommandEncoder {
  public:
   struct CaptureContext {
     CaptureContext(CommandEncoder& enc);
@@ -33,6 +34,7 @@ class CommandEncoder {
   };
 
   explicit CommandEncoder(Device& d);
+  ~CommandEncoder();
 
   CommandEncoder(const CommandEncoder&) = delete;
   CommandEncoder& operator=(const CommandEncoder&) = delete;
@@ -48,10 +50,17 @@ class CommandEncoder {
   void set_output_array(const array& arr);
 
   template <typename F, typename... Params>
-  void add_kernel_node(
-      F* func,
+  void
+  add_kernel_node(F* func, dim3 grid_dim, dim3 block_dim, Params&&... params) {
+    add_kernel_node_ex(func, grid_dim, block_dim, {}, 0, params...);
+  }
+
+  template <typename F, typename... Params>
+  void add_kernel_node_ex(
+      F func,
       dim3 grid_dim,
       dim3 block_dim,
+      dim3 cluster_dim,
       uint32_t smem_bytes,
       Params&&... params) {
     constexpr size_t num = sizeof...(Params);
@@ -60,24 +69,41 @@ class CommandEncoder {
     ([&](auto&& p) { ptrs[i++] = static_cast<void*>(&p); }(
          std::forward<Params>(params)),
      ...);
-    add_kernel_node((void*)func, grid_dim, block_dim, smem_bytes, ptrs);
+    if constexpr (std::is_same_v<F, CUfunction>) {
+      add_kernel_node_raw(
+          func, grid_dim, block_dim, cluster_dim, smem_bytes, ptrs);
+    } else {
+      add_kernel_node_raw(
+          reinterpret_cast<void*>(func),
+          grid_dim,
+          block_dim,
+          cluster_dim,
+          smem_bytes,
+          ptrs);
+    }
   }
 
-  void add_kernel_node(
-      CUfunction func,
-      dim3 grid_dim,
-      dim3 block_dim,
-      uint32_t smem_bytes,
-      void** params);
-
-  void add_kernel_node(
+  void add_kernel_node_raw(
       void* func,
       dim3 grid_dim,
       dim3 block_dim,
+      dim3 cluster_dim,
+      uint32_t smem_bytes,
+      void** params);
+
+  void add_kernel_node_raw(
+      CUfunction func,
+      dim3 grid_dim,
+      dim3 block_dim,
+      dim3 cluster_dim,
       uint32_t smem_bytes,
       void** params);
 
   void add_graph_node(cudaGraph_t child);
+  void add_graph_node(
+      cudaGraph_t child,
+      const std::string& subgraph_key,
+      bool is_updatable);
 
   void add_temporary(const array& arr) {
     temporaries_.push_back(arr.data_shared_ptr());
@@ -86,6 +112,10 @@ class CommandEncoder {
   void add_completed_handler(std::function<void()> task);
   bool needs_commit();
   void commit();
+  void synchronize();
+#ifndef NDEBUG
+  void verify_graph(const char* primitive_name);
+#endif
 
   Device& device() {
     return device_;
@@ -95,12 +125,9 @@ class CommandEncoder {
     return stream_;
   }
 
-  // Wait until kernels and completion handlers are finished
-  void synchronize();
-
  private:
-  void add_kernel_node(const cudaKernelNodeParams& params);
-  void add_kernel_node(const CUDA_KERNEL_NODE_PARAMS& params);
+  cudaGraphNode_t add_kernel_node_raw(const cudaKernelNodeParams& params);
+  CUgraphNode add_kernel_node_raw(const CUDA_KERNEL_NODE_PARAMS& params);
 
   struct GraphNode {
     cudaGraphNode_t node;
@@ -112,14 +139,16 @@ class CommandEncoder {
     std::string id;
   };
 
+  void commit_impl();
+  void clear_graph_state();
   void insert_graph_dependencies(GraphNode node);
   void insert_graph_dependencies(std::vector<GraphNode> nodes);
 
   Device& device_;
   CudaStream stream_;
   CudaGraph graph_;
-  Worker worker_;
-  char node_count_{0};
+  std::shared_ptr<Worker> worker_;
+
   bool in_concurrent_{false};
   std::vector<cudaGraphNode_t> from_nodes_;
   std::vector<cudaGraphNode_t> to_nodes_;
@@ -131,24 +160,31 @@ class CommandEncoder {
   std::vector<std::uintptr_t> active_deps_;
   std::vector<std::uintptr_t> active_outputs_;
   std::unordered_map<std::uintptr_t, GraphNode> node_map_;
-  size_t bytes_in_graph_{0};
+  std::vector<cudaGraphNode_t> roots_;
+#ifndef NDEBUG
+  std::vector<void*> registered_data_ptrs_;
+#endif
   bool is_graph_updatable_{true};
+
+  int node_count_{0};
+  size_t bytes_in_graph_{0};
   int max_ops_per_graph_;
   int max_mb_per_graph_;
+
+  bool force_single_root_;
 };
 
-class Device {
+class MLX_API Device {
  public:
   explicit Device(int device);
   ~Device();
 
+  Device(Device&&) = default;
   Device(const Device&) = delete;
   Device& operator=(const Device&) = delete;
 
   // Make this device the current cuda device, this method is thread-safe.
   void make_current();
-
-  CommandEncoder& get_command_encoder(Stream s);
 
   int cuda_device() const {
     return device_;
@@ -159,31 +195,35 @@ class Device {
   int compute_capability_minor() const {
     return compute_capability_minor_;
   }
-  cublasLtHandle_t lt_handle() const {
-    return lt_;
+  bool concurrent_managed_access() const {
+    return concurrent_managed_access_ == 1;
   }
-  cudnnHandle_t cudnn_handle() const {
-    return cudnn_;
+  bool host_native_atomic() const {
+    return host_native_atomic_ == 1;
+  }
+  bool managed_memory() const {
+    return managed_memory_ == 1;
+  }
+  bool memory_pools() const {
+    return memory_pools_ == 1;
   }
 
  private:
   int device_;
   int compute_capability_major_;
   int compute_capability_minor_;
+  int concurrent_managed_access_;
+  int host_native_atomic_;
+  int managed_memory_;
+  int memory_pools_;
   std::string device_name_;
-  cublasLtHandle_t lt_;
-  cudnnHandle_t cudnn_;
-  std::unordered_map<int, CommandEncoder> encoders_;
 };
 
-Device& device(mlx::core::Device device);
-CommandEncoder& get_command_encoder(Stream s);
+MLX_API Device& device(int cuda_device);
+MLX_API Device& device(mlx::core::Device d);
+MLX_API CommandEncoder& get_command_encoder(Stream s);
 
-// Return an execution policy that does not sync for result.
-// Note that not all thrust APIs support async policy, confirm before using.
-inline auto thrust_policy(cudaStream_t stream) {
-  // TODO: Connect thrust's custom allocator with mlx's allocator.
-  return thrust::cuda::par_nosync.on(stream);
-}
+std::unordered_map<int, CommandEncoder>& get_command_encoders();
+std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 
 } // namespace mlx::core::cu

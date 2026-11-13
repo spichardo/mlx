@@ -20,6 +20,7 @@ template <typename T, int N>
     const device T* in [[buffer(0)]],
     device T* out [[buffer(1)]],
     const constant MLXConvParams<N>* params [[buffer(2)]],
+    const constant int& row_offset [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]]) {
   int filter_size = params->C;
   for (short i = 0; i < N; i++)
@@ -30,7 +31,7 @@ template <typename T, int N>
     out_pixels *= params->oS[i];
 
   // Set out
-  out += gid.z * filter_size + gid.y * (params->C);
+  out += (size_t)gid.z * filter_size + (size_t)gid.y * (params->C);
 
   // Coordinates in input
   int is[N] = {0};
@@ -39,8 +40,9 @@ template <typename T, int N>
   // gid.y: wS (Filter location to unfold input)
   // gid.x: C (channel)
 
-  int n = (gid.z) / out_pixels;
-  int oS = (gid.z) % out_pixels;
+  int global_row = row_offset + int(gid.z);
+  int n = global_row / out_pixels;
+  int oS = global_row % out_pixels;
   int wS = gid.y;
 
   bool valid = n < params->N;
@@ -83,6 +85,7 @@ template <typename T, int N>
     const device T* in [[buffer(0)]],
     device T* out [[buffer(1)]],
     const constant MLXConvParams<N>* params [[buffer(2)]],
+    const constant int& row_offset [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]]) {
   int filter_size = params->C;
   for (short i = 0; i < N; i++)
@@ -93,7 +96,8 @@ template <typename T, int N>
     out_pixels *= params->oS[i];
 
   // Set out
-  out += gid.z * filter_size + gid.x * (filter_size / params->C);
+  out +=
+      (size_t)gid.z * filter_size + (size_t)gid.x * (filter_size / params->C);
 
   // Coordinates in input
   int is[N] = {0};
@@ -102,8 +106,9 @@ template <typename T, int N>
   // gid.y: wS (Filter location to unfold input)
   // gid.x: C (channel)
 
-  int n = (gid.z) / out_pixels;
-  int oS = (gid.z) % out_pixels;
+  int global_row = row_offset + int(gid.z);
+  int n = global_row / out_pixels;
+  int oS = global_row % out_pixels;
   int wS = gid.y;
 
   bool valid = n < params->N;
@@ -149,6 +154,7 @@ template <typename T, int N>
       const device itype* in [[buffer(0)]],                                    \
       device itype* out [[buffer(1)]],                                         \
       const constant MLXConvParams<n>* params [[buffer(2)]],                   \
+      const constant int& row_offset [[buffer(3)]],                            \
       uint3 gid [[thread_position_in_grid]]);                                  \
   template                                                                     \
       [[host_name("naive_unfold_transpose_nd_" #name "_" #n)]] [[kernel]] void \
@@ -156,6 +162,7 @@ template <typename T, int N>
           const device itype* in [[buffer(0)]],                                \
           device itype* out [[buffer(1)]],                                     \
           const constant MLXConvParams<n>* params [[buffer(2)]],               \
+          const constant int& row_offset [[buffer(3)]],                        \
           uint3 gid [[thread_position_in_grid]]);
 
 #define instantiate_naive_unfold_nd_dims(name, itype)                      \
@@ -205,7 +212,7 @@ template <typename T>
 
   threadgroup T ins[TGH * TGW * TGC];
 
-  const int n_tgblocks_h = params.oS[0] / th;
+  const int n_tgblocks_h = (params.oS[0] + th - 1) / th;
   const int n = tid.z / n_tgblocks_h;
   const int tghid = tid.z % n_tgblocks_h;
   const int oh = tghid * th + lid.z;
@@ -275,6 +282,10 @@ template <typename T>
     }
   }
   threadgroup_barrier(mem_flags::mem_none);
+
+  if (oh >= params.oS[0] || ow >= params.oS[1]) {
+    return;
+  }
 
   out += n * params.out_strides[0] + oh * params.out_strides[1] +
       ow * params.out_strides[2];
@@ -407,8 +418,8 @@ winograd_conv_2d_weight_transform(
   // wt_out is stored transposed (A x A x C x O)
   short ohw_0 = sm * 8 + sn;
   short ohw_1 = sm * 8 + sn + 1;
-  device T* wt_out_0 = wt_out + ohw_0 * C * O + ko;
-  device T* wt_out_1 = wt_out + ohw_1 * C * O + ko;
+  device T* wt_out_0 = wt_out + size_t(ohw_0) * C * O + ko;
+  device T* wt_out_1 = wt_out + size_t(ohw_1) * C * O + ko;
 
   // Prepare shared memory
   threadgroup T Ws[BO][R][R][BC];
@@ -445,20 +456,20 @@ winograd_conv_2d_weight_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_weight_transform_base(name, itype, bc) \
-  template [[host_name("winograd_conv_2d_weight_transform_" #name           \
-                       "_bc" #bc)]] [[kernel]] void                         \
-  winograd_conv_2d_weight_transform<itype, bc>(                             \
-      const device itype* wt_in [[buffer(0)]],                              \
-      device itype* wt_out [[buffer(1)]],                                   \
-      const constant int& C [[buffer(2)]],                                  \
-      const constant int& O [[buffer(3)]],                                  \
-      uint tid [[threadgroup_position_in_grid]],                            \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],                \
+#define instantiate_winograd_conv_2d_weight_transform_base(name, itype, bc)   \
+  template [[host_name(                                                       \
+      "winograd_conv_2d_weight_transform_" #name "_bc" #bc)]] [[kernel]] void \
+  winograd_conv_2d_weight_transform<itype, bc>(                               \
+      const device itype* wt_in [[buffer(0)]],                                \
+      device itype* wt_out [[buffer(1)]],                                     \
+      const constant int& C [[buffer(2)]],                                    \
+      const constant int& O [[buffer(3)]],                                    \
+      uint tid [[threadgroup_position_in_grid]],                              \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                  \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 template <typename T, int BC, int WM, int WN, int M = 6, int R = 3>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 winograd_conv_2d_input_transform(
     const device T* inp_in [[buffer(0)]],
     device T* inp_out [[buffer(1)]],
@@ -555,21 +566,21 @@ winograd_conv_2d_input_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_input_transform(name, itype, bc) \
-  template [[host_name("winograd_conv_2d_input_transform_" #name      \
-                       "_bc" #bc)]] [[kernel]] void                   \
-  winograd_conv_2d_input_transform<itype, bc, 2, 2>(                  \
-      const device itype* inp_in [[buffer(0)]],                       \
-      device itype* inp_out [[buffer(1)]],                            \
-      const constant MLXConvParams<2>& params [[buffer(2)]],          \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint3 lid [[thread_position_in_threadgroup]],                   \
-      uint3 tgp_per_grid [[threadgroups_per_grid]],                   \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],          \
+#define instantiate_winograd_conv_2d_input_transform(name, itype, bc)        \
+  template [[host_name(                                                      \
+      "winograd_conv_2d_input_transform_" #name "_bc" #bc)]] [[kernel]] void \
+  winograd_conv_2d_input_transform<itype, bc, 2, 2>(                         \
+      const device itype* inp_in [[buffer(0)]],                              \
+      device itype* inp_out [[buffer(1)]],                                   \
+      const constant MLXConvParams<2>& params [[buffer(2)]],                 \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint3 lid [[thread_position_in_threadgroup]],                          \
+      uint3 tgp_per_grid [[threadgroups_per_grid]],                          \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                 \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 template <typename T, int BO, int WM, int WN, int M = 6, int R = 3>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 winograd_conv_2d_output_transform(
     const device T* out_in [[buffer(0)]],
     device T* out_out [[buffer(1)]],
@@ -676,17 +687,17 @@ winograd_conv_2d_output_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_output_transform(name, itype, bo) \
-  template [[host_name("winograd_conv_2d_output_transform_" #name      \
-                       "_bo" #bo)]] [[kernel]] void                    \
-  winograd_conv_2d_output_transform<itype, bo, 2, 2>(                  \
-      const device itype* out_in [[buffer(0)]],                        \
-      device itype* out_out [[buffer(1)]],                             \
-      const constant MLXConvParams<2>& params [[buffer(2)]],           \
-      uint3 tid [[threadgroup_position_in_grid]],                      \
-      uint3 lid [[thread_position_in_threadgroup]],                    \
-      uint3 tgp_per_grid [[threadgroups_per_grid]],                    \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],           \
+#define instantiate_winograd_conv_2d_output_transform(name, itype, bo)        \
+  template [[host_name(                                                       \
+      "winograd_conv_2d_output_transform_" #name "_bo" #bo)]] [[kernel]] void \
+  winograd_conv_2d_output_transform<itype, bo, 2, 2>(                         \
+      const device itype* out_in [[buffer(0)]],                               \
+      device itype* out_out [[buffer(1)]],                                    \
+      const constant MLXConvParams<2>& params [[buffer(2)]],                  \
+      uint3 tid [[threadgroup_position_in_grid]],                             \
+      uint3 lid [[thread_position_in_threadgroup]],                           \
+      uint3 tgp_per_grid [[threadgroups_per_grid]],                           \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                  \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 // clang-format off

@@ -1,8 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
-import math
 import unittest
-from itertools import permutations
 
 import mlx.core as mx
 import mlx_tests
@@ -12,8 +10,15 @@ try:
     import torch
 
     has_torch = True
-except ImportError as e:
+except ImportError:
     has_torch = False
+
+try:
+    import ml_dtypes
+
+    has_ml_dtypes = True
+except ImportError:
+    has_ml_dtypes = False
 
 
 class TestBF16(mlx_tests.MLXTestCase):
@@ -64,8 +69,11 @@ class TestBF16(mlx_tests.MLXTestCase):
             ref_op = np_fn
             mlx_op = mlx_fn
 
-            ref_transform = lambda x: simple_transform(np_transform(x))
-            mlx_transform = lambda x: simple_transform(mx.array(x).astype(mx.bfloat16))
+            def ref_transform(x):
+                return simple_transform(np_transform(x))
+
+            def mlx_transform(x):
+                return simple_transform(mx.array(x).astype(mx.bfloat16))
 
             self.__test_ops(
                 ref_op,
@@ -85,9 +93,10 @@ class TestBF16(mlx_tests.MLXTestCase):
                     return out_bf16.to(torch.float32).numpy()
 
                 ref_op = torch_fn
-                ref_transform = lambda x: simple_transform(
-                    torch.from_numpy(x).to(torch.bfloat16)
-                )
+
+                def ref_transform(x):
+                    return simple_transform(torch.from_numpy(x).to(torch.bfloat16))
+
                 self.__test_ops(
                     ref_op,
                     mlx_op,
@@ -133,6 +142,21 @@ class TestBF16(mlx_tests.MLXTestCase):
                             torch_kwargs={"dim": axes},
                             torch_op="a" + op,
                         )
+
+    def test_arithmetic_reduction_ops(self):
+        cases = {
+            "sum": np.ones((4096, 4), dtype=np.float32),
+            "prod": np.full((128, 4), 1.0078125, dtype=np.float32),
+        }
+        for op, values in cases.items():
+            with self.subTest(op=op):
+                x = mx.array(values, dtype=mx.bfloat16)
+                expected = mx.array(
+                    getattr(np, op)(values, axis=0, dtype=np.float32),
+                    dtype=mx.bfloat16,
+                )
+                actual = getattr(mx, op)(x, axis=0, stream=mx.cpu)
+                self.assertEqual(actual.tolist(), expected.tolist())
 
     def test_arg_reduction_ops(self):
         data = np.random.rand(10, 12, 13).astype(np.float32)
@@ -190,6 +214,31 @@ class TestBF16(mlx_tests.MLXTestCase):
         expected = mx.array([1.0, 2.0, 3.0], mx.bfloat16)
         self.assertEqual(a_mx.dtype, mx.bfloat16)
         self.assertTrue(mx.array_equal(a_mx, expected))
+
+    @unittest.skipIf(not has_ml_dtypes, "requires ml_dtypes")
+    def test_conversion_ml_dtypes(self):
+        x_scalar = np.array(1.5, dtype=ml_dtypes.bfloat16)
+        a_scalar = mx.array(x_scalar)
+        self.assertEqual(a_scalar.dtype, mx.bfloat16)
+        self.assertEqual(a_scalar.shape, ())
+        self.assertEqual(a_scalar.item(), 1.5)
+
+        data = [1.5, 2.5, 3.5]
+        x_vector = np.array(data, dtype=ml_dtypes.bfloat16)
+        a_vector = mx.array(x_vector)
+        expected = mx.array(data, dtype=mx.bfloat16)
+        self.assertEqual(a_vector.dtype, mx.bfloat16)
+        self.assertEqual(a_vector.shape, (3,))
+        self.assertTrue(mx.array_equal(a_vector, expected))
+
+        a_cast = mx.array(x_scalar, dtype=mx.float32)
+        self.assertEqual(a_cast.dtype, mx.float32)
+        self.assertEqual(a_cast.item(), 1.5)
+
+        a_asarray = mx.asarray(x_vector)
+        self.assertEqual(a_asarray.dtype, mx.bfloat16)
+        self.assertEqual(a_asarray.shape, (3,))
+        self.assertTrue(mx.array_equal(a_asarray, expected))
 
 
 if __name__ == "__main__":

@@ -460,6 +460,9 @@ void dispatch_headdim(int n, F&& f) {
     case 128:
       f(std::integral_constant<int, 128>{});
       break;
+    case 256:
+      f(std::integral_constant<int, 256>{});
+      break;
   }
 }
 
@@ -511,7 +514,6 @@ void sdpa_vector_1pass_fallback(
             kernel,
             grid_dim,
             block_dim,
-            0,
             gpu_ptr<DataType>(q),
             gpu_ptr<DataType>(k),
             gpu_ptr<DataType>(v),
@@ -599,7 +601,6 @@ void sdpa_vector_2pass_fallback(
               kernel,
               grid_dim,
               block_dim,
-              0,
               gpu_ptr<DataType>(q),
               gpu_ptr<DataType>(k),
               gpu_ptr<DataType>(v),
@@ -626,7 +627,6 @@ void sdpa_vector_2pass_fallback(
               kernel,
               grid_dim,
               block_dim,
-              0,
               gpu_ptr<float>(intermediate),
               gpu_ptr<float>(sums),
               gpu_ptr<float>(maxs),
@@ -665,9 +665,7 @@ bool supports_sdpa_vector(
     const array& q,
     const array& k,
     const array& v,
-    bool has_mask,
     bool has_arr_mask,
-    bool do_causal,
     bool output_logsumexp) {
   if (output_logsumexp) {
     return false;
@@ -679,7 +677,8 @@ bool supports_sdpa_vector(
   const int key_sequence_length = k.shape(2);
 
   const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256);
 
   const bool supported_vector_config =
       sdpa_supported_head_dim && query_sequence_length < 4;

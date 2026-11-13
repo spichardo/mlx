@@ -21,11 +21,12 @@ array::array(
     Dtype dtype,
     std::shared_ptr<Primitive> primitive,
     std::vector<array> inputs)
-    : array_desc_(std::make_shared<ArrayDesc>(
-          std::move(shape),
-          dtype,
-          std::move(primitive),
-          std::move(inputs))) {
+    : array_desc_(
+          std::make_shared<ArrayDesc>(
+              std::move(shape),
+              dtype,
+              std::move(primitive),
+              std::move(inputs))) {
   if (has_primitive() && this->primitive().stream().device == Device::gpu) {
     for (auto& in : this->inputs()) {
       if (in.dtype() == float64) {
@@ -59,26 +60,27 @@ std::vector<array> array::make_arrays(
 array array::unsafe_weak_copy(const array& other) {
   auto cpy = array(other.shape(), other.dtype(), nullptr, {});
   cpy.set_data(
-      other.buffer(),
+      Data(other.buffer(), nullptr),
       other.data_size(),
       other.strides(),
       other.flags(),
-      [](auto) {});
-  cpy.array_desc_->offset = other.array_desc_->offset;
+      other.offset());
   return cpy;
 }
 
 array::array(std::initializer_list<float> data)
-    : array_desc_(std::make_shared<ArrayDesc>(
-          Shape{static_cast<ShapeElem>(data.size())},
-          float32)) {
+    : array_desc_(
+          std::make_shared<ArrayDesc>(
+              Shape{static_cast<ShapeElem>(data.size())},
+              float32)) {
   init(data.begin());
 }
 
 array::array(std::initializer_list<int> data, Dtype dtype)
-    : array_desc_(std::make_shared<ArrayDesc>(
-          Shape{static_cast<ShapeElem>(data.size())},
-          dtype)) {
+    : array_desc_(
+          std::make_shared<ArrayDesc>(
+              Shape{static_cast<ShapeElem>(data.size())},
+              dtype)) {
   init(data.begin());
 }
 
@@ -100,14 +102,13 @@ array::array(
       allocator::release(buffer);
       return deleter(ptr);
     };
-    set_data(buffer, std::move(wrapped_deleter));
+    set_data(Data(buffer, std::move(wrapped_deleter)));
   }
 }
 
-/* Build an array from a shared buffer */
-array::array(allocator::Buffer data, Shape shape, Dtype dtype, Deleter deleter)
+array::array(allocator::Data data, Shape shape, Dtype dtype)
     : array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
-  set_data(data, deleter);
+  set_data(std::move(data));
 }
 
 void array::detach() {
@@ -131,6 +132,7 @@ bool array::is_available() const {
   } else if (
       status() == Status::evaluated &&
       (!event().valid() || event().is_signaled())) {
+    detach_event();
     set_status(Status::available);
     return true;
   }
@@ -161,8 +163,8 @@ bool array::is_tracer() const {
       detail::retain_graph();
 }
 
-void array::set_data(allocator::Buffer buffer, Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
+void array::set_data(allocator::Data data) {
+  array_desc_->data = std::make_shared<Data>(std::move(data));
   array_desc_->offset = 0;
   array_desc_->data_size = size();
   array_desc_->flags.contiguous = true;
@@ -172,13 +174,13 @@ void array::set_data(allocator::Buffer buffer, Deleter d) {
 }
 
 void array::set_data(
-    allocator::Buffer buffer,
+    allocator::Data data,
     size_t data_size,
     Strides strides,
     Flags flags,
-    Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
-  array_desc_->offset = 0;
+    int64_t offset) {
+  array_desc_->data = std::make_shared<Data>(std::move(data));
+  array_desc_->offset = offset;
   array_desc_->data_size = data_size;
   array_desc_->strides = std::move(strides);
   array_desc_->flags = flags;
@@ -202,34 +204,33 @@ void array::copy_shared_buffer(const array& other) {
   copy_shared_buffer(other, other.strides(), other.flags(), other.data_size());
 }
 
-array::~array() {
-  if (array_desc_ == nullptr) {
+void array::release(std::shared_ptr<ArrayDesc> desc) {
+  if (desc == nullptr) {
     return;
   }
 
   // Detached/detaching
-  if (array_desc_->primitive == nullptr) {
+  if (desc->primitive == nullptr) {
     return;
   }
 
   // Break circular reference for non-detached arrays with siblings
-  if (auto n = siblings().size(); n > 0) {
+  if (auto n = desc->siblings.size(); n > 0) {
     bool do_detach = true;
     // If all siblings have siblings.size() references except
-    // the one we are currently destroying (which has siblings.size() + 1)
+    // the one we are currently releasing (which has siblings.size() + 1)
     // then there are no more external references
-    do_detach &= (array_desc_.use_count() == (n + 1));
-    for (auto& s : siblings()) {
+    do_detach &= (desc.use_count() == (n + 1));
+    for (auto& s : desc->siblings) {
       do_detach &= (s.array_desc_.use_count() == n);
       if (!do_detach) {
         break;
       }
     }
     if (do_detach) {
-      for (auto& s : siblings()) {
+      for (auto& s : desc->siblings) {
         for (auto& ss : s.siblings()) {
-          // Set to null here to avoid descending into array destructor
-          // for siblings
+          // Set to null here to avoid descending into reset() for siblings
           ss.array_desc_ = nullptr;
         }
         s.array_desc_->siblings.clear();
